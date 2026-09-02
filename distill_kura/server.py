@@ -227,6 +227,14 @@ def _make_handler(reg: Registry):
                 p = json.loads(self.rfile.read(n) or b"{}")
             except ValueError:
                 return self._send(400, {"error": "bad json"})
+            if path.startswith("/thinker"):
+                try:
+                    reg.set_thinker_override(p.get("url", ""), p.get("model", "default"),
+                                             p.get("effort", "low"), p.get("dialect", "vllm"))
+                except ValueError as e:
+                    return self._send(400, {"error": str(e)})
+                return self._send(200, {"ok": True, "thinker": p.get("model", "default"),
+                                        "url": p.get("url", "")})
             sel = sel or p.get("store") or p.get("mode") or ""
             st, err = self._store(sel)
             if err:

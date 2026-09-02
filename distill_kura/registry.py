@@ -61,7 +61,7 @@ import tomllib
 from dataclasses import dataclass, field
 
 from .store import Store
-from .thinker import Models
+from .thinker import Endpoint, Models
 from .prefill import RESIDENT_MODES
 
 CONFIG_CANDIDATES = ("kura.toml", os.path.expanduser("~/.config/distill-kura/kura.toml"))
@@ -330,6 +330,8 @@ class Registry:
     port: int = 8085
     config_path: str | None = None
     raw: dict = field(default_factory=dict)
+    # Runtime override — set via POST /thinker, never persisted.
+    thinker_override: Endpoint | None = None
 
     # ── loading ──────────────────────────────────────────────────────────
     @classmethod
@@ -394,8 +396,14 @@ class Registry:
         _check_paths(stores, raw)
         _check_mouths(raw, stores)
         models_cfg = raw.get("models")
-        if not models_cfg and os.environ.get("KURA_THINKER_URL"):      # legacy env
-            models_cfg = {"thinker": {"url": os.environ["KURA_THINKER_URL"],
+        # Env override wins over [models] without touching the file — a host that wants
+        # its own recall model (e.g. the one the conversation uses) sets it on the
+        # server process instead of rewriting kura.toml. Thinker only; brain/scribe keep
+        # whatever [models] declared.
+        if os.environ.get("KURA_THINKER_URL"):
+            models_cfg = {**dict(models_cfg or {}),
+                          "thinker": {**dict((models_cfg or {}).get("thinker") or {}),
+                                      "url": os.environ["KURA_THINKER_URL"],
                                       "model": os.environ.get("KURA_THINKER_MODEL", "default")}}
         _check_models("models", models_cfg)
         profiles = {}
@@ -472,11 +480,25 @@ class Registry:
         One shared set of endpoints means one endpoint sees every store's index, every
         journal and every draft — so separating stores on disk buys nothing against the
         model. A store naming a profile gets that profile and nothing else; an undefined
-        profile is a load error rather than a quiet fall back to the shared one."""
+        profile is a load error rather than a quiet fall back to the shared one.
+
+        If a runtime thinker override is active (set via POST /thinker), recall uses
+        that endpoint; the distiller's brain/scribe are untouched."""
         want = store.model_profile
-        if not want:
-            return self.models
-        return self.profiles[want]
+        base = self.profiles[want] if want else self.models
+        if self.thinker_override:
+            return Models(thinker=self.thinker_override,
+                          brain=base.brain, scribe=base.scribe)
+        return base
+
+    def set_thinker_override(self, url: str, model: str = "default",
+                             effort: str = "low", dialect: str = "vllm") -> None:
+        """Point the recall role at a different model, at runtime, without touching
+        kura.toml. The distiller's brain/scribe are untouched; recall-only."""
+        if not url:
+            raise ValueError("thinker_override needs a non-empty url")
+        self.thinker_override = Endpoint(url=url, model=model,
+                                         effort=effort, dialect=dialect)
 
     @property
     def prefill_cfg(self) -> dict:
