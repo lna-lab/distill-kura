@@ -167,7 +167,7 @@ def text_file(tmp_path, kind: str) -> str:
 def test_claude_claim_bound_is_where_the_read_stops(tmp_path, kind, budget):
     src, path = ClaudeCodeSource(), CLAUDE_CORPUS[kind](tmp_path)
     for start in (0, 1_000 if os.path.getsize(path) > 1_000 else 0):
-        end, _ = src.claim_bound(path, start, budget)
+        end, _, _ = src.claim_bound(path, start, budget)
         _, stop = src.sip(path, start, budget)
         assert end == stop, f"{kind}: reserved {end}, read stopped at {stop}"
 
@@ -177,7 +177,7 @@ def test_claude_reserve_no_longer_multiplies_the_budget_by_four(tmp_path):
     The old rule reserved 80 000 B; the read stopped at ~30 000 B. Everything in
     between was marked drunk without being read."""
     src, path = ClaudeCodeSource(), ascii_journal(tmp_path)
-    end, _ = src.claim_bound(path, 0, 20_000)
+    end, _, _ = src.claim_bound(path, 0, 20_000)
     _, stop = src.sip(path, 0, 20_000)
     assert end == stop
     assert end < 20_000 * 4                      # the old arithmetic, still failing here
@@ -188,7 +188,7 @@ def test_claude_reserve_no_longer_multiplies_the_budget_by_four(tmp_path):
 def test_dsh_claim_bound_is_where_the_read_stops(dsh, kind, budget):
     src, path, _ = dsh(kind)
     for start in (0, 5):
-        end, _ = src.claim_bound(path, start, budget)
+        end, _, _ = src.claim_bound(path, start, budget)
         _, stop = src.sip(path, start, budget)
         assert end == stop
 
@@ -198,7 +198,7 @@ def test_dsh_claim_bound_is_where_the_read_stops(dsh, kind, budget):
 def test_text_claim_bound_is_where_the_read_stops(tmp_path, kind, budget):
     src, path = TextSource(), text_file(tmp_path, kind)
     for start in (0, 7):
-        end, _ = src.claim_bound(path, start, budget)
+        end, _, _ = src.claim_bound(path, start, budget)
         _, stop = src.sip(path, start, budget)
         assert end == stop
 
@@ -229,8 +229,10 @@ def _drain(src, path, marks_path, budget, rounds=4000):
         c = wm.claim([path], budget, 1)
         if not c:
             return got, stretches
-        _, start, s = c
-        segs, stop = s.sip(path, start, budget)
+        if c.scan_pending:
+            continue
+        _, start, bound_end, s, _ = c
+        segs, stop = s.sip(path, start, budget, bound_end=bound_end)
         wm.advance(s.key(path), stop)
         got += segs
         stretches.append((start, stop))
@@ -284,7 +286,7 @@ def test_two_interleaved_claimers_never_overlap(tmp_path, kind):
         c = wm.claim([path], 2_000, 1)
         if not c:
             break
-        _, start, s = c
+        _, start, _, s, _ = c
         segs, stop = s.sip(path, start, 2_000)
         wm.advance(s.key(path), stop)
         taken.append((start, stop))
@@ -305,7 +307,7 @@ def test_two_interleaved_dsh_claimers_never_overlap(dsh, tmp_path):
         c = wm.claim([path], 400, 1)
         if not c:
             break
-        _, start, s = c
+        _, start, _, s, _ = c
         segs, stop = s.sip(path, start, 400)
         wm.advance(s.key(path), stop)
         taken.append((start, stop))
@@ -329,7 +331,8 @@ def test_claim_reserves_before_the_read(tmp_path):
     runner starting in the same breath gets the same water."""
     src, path = ClaudeCodeSource(), ascii_journal(tmp_path, lines=500)
     wm = Watermarks(str(tmp_path / "m7" / "marks.json"))
-    _, start, s = wm.claim([path], 4_000, 1)
+    c = wm.claim([path], 4_000, 1)
+    start, s = c.start, c.source
     assert wm.read()[s.key(path)] > start                   # written before any sip()
-    end, _ = s.claim_bound(path, start, 4_000)
+    end, _, _ = s.claim_bound(path, start, 4_000)
     assert wm.read()[s.key(path)] == end

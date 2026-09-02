@@ -352,6 +352,7 @@ a store actually consumed.
 claude = "~/.claude/projects/my-project"   # Claude Code transcripts (.jsonl)
 dsh    = "~/dsh/sessions"                  # DSH sessions (.jsonl.zstd; needs `zstd`)
 text   = "~/notes"                         # .md/.txt/.log, all treated as [USER]
+evidence = "~/journals"                    # classified .evidence.jsonl (USER/SELF/ACT/TOOL)
 ```
 
 Newest journals are drunk first: today's decisions are worth the most. A batch is
@@ -421,6 +422,38 @@ number carried in the events for anything that gets rewritten. Then add a key un
 `[distill.journals]`. The evidence classes are the contract — get the mapping right
 (`USER` / `TOOL` / `ACT` / `SELF`, and drop reasoning blocks) and everything downstream
 works unchanged.
+
+### Classified `.evidence.jsonl`
+
+One JSON object per complete line, `schema_version` 1 (an integer, not `true`), classes
+exactly `USER` / `SELF` / `ACT` / `TOOL`. Required string fields: `event_id`,
+`session_id`, `turn_id`, `text`, `timestamp`.
+
+`timestamp` is an RFC3339 date-time **with a timezone**, parsed by
+`datetime.fromisoformat` after a trailing `Z` is rewritten to `+00:00`.
+
+Accepted: `2026-08-27T00:00:00Z`, `2026-08-27T00:00:00.123Z`, `2026-08-27T09:00:00+09:00`.
+Rejected: missing or non-string values, date-only, naive datetimes, a space instead of
+`T`, leap seconds, and offsets with seconds. The clock is not consulted and the record
+is not rewritten; the timestamp is a gate, not a stored field.
+
+Identity fields are at most 256 characters; a raw line is at most 32 KiB. Oversized
+identity values and raw lines are skipped, never truncated into valid records. `text`
+is class-capped (`USER` / `SELF` / `ACT` at 4000 characters, `TOOL` at 1500) after
+strip. Invalid, malformed,
+unknown-version, unknown-class, blank, missing, oversized, and partial final lines are
+skipped and counted in `_still/intake.jsonl` (basename, reason, byte offset, size — not
+payloads, not full paths). A reporting failure cannot break a sip.
+
+The byte watermark stops on a complete-record boundary. `claim` reserves the same end
+`sip` will drink, so a partial tail or a char-budget stop cannot skip unread bytes.
+
+Custom `Source` adapters may return a legacy two-value `claim_bound` result
+``(end, approx)``; the distiller normalizes it to ``(end, approx, 0)``. A third value,
+when present, is ``scan_pending``: bounded bytes discarded through an irreversibly
+oversized line while the watermark stayed at ``start``. Legacy `sip` without
+``bound_end`` is single-runner only — concurrent reservation isolation requires a
+``bound_end``-aware adapter.
 
 ## Measuring rather than guessing
 

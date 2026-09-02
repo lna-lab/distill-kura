@@ -196,6 +196,7 @@ yield_on_return = true      # stop a running track when the journal changes. Set
 
 [distill.journals]
 claude = "~/.claude/projects/my-project"
+# evidence = "~/journals"   # classified .evidence.jsonl (USER/SELF/ACT/TOOL)
 # dsh  = "~/dsh/sessions"
 # text = "~/notes"
 

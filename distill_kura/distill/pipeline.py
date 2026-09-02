@@ -29,6 +29,7 @@ import json
 import os
 import re
 import time
+from typing import NamedTuple
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -40,8 +41,15 @@ from . import prompts, transition
 from .gate import (attributes_to_human, composed_number_violations,
                    final_surface_violations, gate, norm, salvage, verify_tags)
 from .seeds import Seeds
-from .sources import Segment, as_evidence, discover_all, source_for
+from .sources import Segment, as_evidence, call_claim_bound, call_sip, discover_all, source_for, IntakeReport, SCAN_LIMIT
 from .watermark import Watermarks
+
+
+class SipPending(NamedTuple):
+    """Bounded discard progress: watermark unchanged, retry without draining."""
+    path: str
+    key: str
+    scan_pending_bytes: int
 
 CHUNK_CHARS = 200_000        # one batch ≈ what a long-context reader swallows at once
 MIN_DRINK = 6_000            # less raw material than this is not worth a pass
@@ -1159,7 +1167,22 @@ class Distiller:
             if not src:
                 continue
             k = src.key(path)
-            end, _ = src.claim_bound(path, 0, 1 << 40)   # the whole file, in its own unit
+            pos = 0
+            end = 0
+            pending_passes = 0
+            size = os.path.getsize(path)
+            while True:
+                end, _, scan_pending = call_claim_bound(src, path, pos, 1 << 40)
+                if scan_pending <= 0:
+                    break
+                if end > pos:
+                    pos = end
+                    pending_passes = 0
+                    continue
+                pending_passes += 1
+                if pending_passes > size // SCAN_LIMIT + 16:
+                    end = pos
+                    break
             before = self.marks.read().get(k, 0)
             seen += 1
             if end > before:
@@ -1167,14 +1190,35 @@ class Distiller:
                 moved[k] = end
         return {"ok": True, "journals": seen, "moved": len(moved), "at": moved}
 
-    def sip_one(self, session: str | None = None) -> tuple[list[Segment], str, str] | None:
+    def sip_one(self, session: str | None = None
+                ) -> tuple[list[Segment], str, str] | SipPending | None:
         c = self.marks.claim(self.files(session), self.chunk_chars, MIN_DRINK)
         if not c:
             return None
-        path, start, src = c
-        segs, nxt = src.sip(path, start, self.chunk_chars)
+        path, start, bound_end, src = c.path, c.start, c.end, c.source
+        if c.scan_pending:
+            return SipPending(path, src.key(path), c.scan_pending)
+        report = IntakeReport()
+        segs, nxt = call_sip(src, path, start, self.chunk_chars,
+                             report=report, bound_end=bound_end)
         self.marks.advance(src.key(path), nxt)
+        self._emit_intake(path, report)
         return segs, path, src.key(path)
+
+    def _emit_intake(self, path: str, report: IntakeReport) -> None:
+        """One bounded summary per sip. A diagnostic must never break a pass,
+        print evidence text, or grow without a cap — samples already are."""
+        if not report.skipped:
+            return
+        try:
+            _log(f"intake: {os.path.basename(path)} skipped {report.total} "
+                 f"({', '.join(f'{k}={v}' for k, v in report.skipped.items())})")
+            row = {"source": os.path.basename(path), **report.as_dict()}
+            os.makedirs(self.still, exist_ok=True)
+            with open(os.path.join(self.still, "intake.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except Exception:
+            pass                        # a diagnostic must never break a pass
 
     def _metric(self, row: dict) -> None:
         """One line per batch, so the pipeline's behaviour is a measurement rather than
@@ -1195,10 +1239,14 @@ class Distiller:
     def run(self, session: str | None = None, chunks: int = 1) -> dict:
         made, killed, covered, sown, recurred = [], 0, 0, 0, 0
         cue_receipts = cue_receipt_failures = 0
+        scan_pending_bytes = 0
         for _ in range(chunks):
             got = self.sip_one(session)
             if not got:
                 break
+            if isinstance(got, SipPending):
+                scan_pending_bytes += got.scan_pending_bytes
+                continue
             segs, path, key = got
             self._current_key = key
             self._current_source = path
@@ -1305,6 +1353,8 @@ class Distiller:
                 "index_tokens_est": estimate(self.store.index_text()),
             })
         if not made and not killed and not covered and not sown:
+            if scan_pending_bytes:
+                return {"ok": True, "scan_pending_bytes": scan_pending_bytes}
             return {"ok": True, "why": "nothing worth drinking"}
         return {"ok": True, "drafts": made, "dropped": killed, "covered": covered,
                 "recurred": recurred, "seeds": sown,
@@ -1328,12 +1378,19 @@ class Distiller:
             if last == stamp:
                 time.sleep(600)          # already did a pass in this silence
                 continue
-            last = stamp
             try:
-                _log(f"  {self.run(chunks=1)}")
-                _log(f"  {self.drain()}")
+                result = self.run(chunks=1)
+                _log(f"  {result}")
             except Exception as e:       # a bad pass must not end the watch
                 _log(f"  pass failed: {type(e).__name__}: {e}")
+                result = {}
+            if result.get("scan_pending_bytes"):
+                continue                 # bounded discard progress — retry same quiet
+            try:
+                _log(f"  {self.drain()}")
+            except Exception as e:       # a bad drain must not end the watch
+                _log(f"  drain failed: {type(e).__name__}: {e}")
+            last = stamp
 
 
 def drafts_of(store: Store) -> list[tuple[str, str, str]]:

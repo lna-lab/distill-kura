@@ -19,8 +19,17 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+from typing import NamedTuple
 
-from .sources import Source, source_for
+from .sources import Source, call_claim_bound, source_for
+
+
+class Claim(NamedTuple):
+    path: str
+    start: int
+    end: int
+    source: Source
+    scan_pending: int = 0
 
 
 class Watermarks:
@@ -55,8 +64,15 @@ class Watermarks:
                 fcntl.flock(lk, fcntl.LOCK_UN)
 
     def claim(self, files: list[str], budget_chars: int,
-              min_chars: int) -> tuple[str, int, Source] | None:
-        """Reserve the next stretch worth drinking. Returns (path, start, source)."""
+              min_chars: int) -> Claim | None:
+        """Reserve the next stretch worth drinking.
+
+        Returns a Claim. ``end`` is the reserved watermark unit sip must not read
+        past — a second runner may already own bytes/events after it. When
+        ``scan_pending`` is non-zero the watermark did not move: a source made
+        bounded discard progress through an irreversibly-oversized line and the
+        caller must retry without treating silence as completion.
+        """
         with open(self.path + ".lock", "w") as lk:
             fcntl.flock(lk, fcntl.LOCK_EX)
             try:
@@ -77,12 +93,14 @@ class Watermarks:
                     # stop); claiming more is silent loss, the unforgivable direction.
                     # So no adapter may compute this by a second rule: claim_bound()
                     # takes the same walk sip() takes, and pays the second read.
-                    end, approx = src.claim_bound(path, start, budget_chars)
-                    if approx < min_chars or end <= start:
-                        continue
-                    cur[k] = end
-                    self._write(cur)
-                    return path, start, src
+                    end, approx, scan_pending = call_claim_bound(
+                        src, path, start, budget_chars)
+                    if approx >= min_chars and end > start:
+                        cur[k] = end
+                        self._write(cur)
+                        return Claim(path, start, end, src)
+                    if scan_pending > 0 and end <= start:
+                        return Claim(path, start, start, src, scan_pending=scan_pending)
                 return None
             finally:
                 fcntl.flock(lk, fcntl.LOCK_UN)
