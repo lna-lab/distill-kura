@@ -2,6 +2,35 @@
 
 ## 0.3.0 — unreleased
 
+### Lna Harness journals as a source (`lna`)
+
+A fourth adapter: `**/*.lna.jsonl`, one JSON *run* per line, byte-offset watermark.
+Registered as `SOURCES["lna"]` and tested before `claude` in `source_for()`, because an
+`.lna.jsonl` also ends in `.jsonl` and would otherwise be read by the wrong adapter.
+
+The Journal is the first source carrying structured provenance — `origin.rootKind`,
+`origin.currentKind`, `origin.delegated` — so `[USER]` can be decided positively instead
+of by dropping whatever smells injected. It is decided fail-closed: only a root-human,
+current-human, undelegated user message is the human's own sentence. `agent`, `service`,
+`unknown`, a missing `origin`, and every delegated turn are `[SELF]`, never promoted.
+Assistant prose is `[SELF]`, `tool-call` is `[ACT]`, `tool-result` is `[TOOL]`. A failed
+run keeps its human evidence: the outcome says the machine had a bad day, not that the
+person never spoke — and a provider error is never laundered into `[TOOL]`.
+
+Two rules the walk keeps that the other append-only adapter does not need:
+
+- **A partial final line is never read.** The writer may be mid-append. The walk reads
+  in binary, and a line not ending in `\n` stops it at that line's own start, so the
+  mark waits for the run to finish rather than swallowing half of it.
+- **A completed line that does not parse, and a record with an unsupported `v` or
+  `type`, fail loud.** Filing a corrupt evidence source as drunk is the worse error.
+
+Because the walk can raise, `claim_bound()` takes the same walk `sip()` takes and has no
+size shortcut. `Watermarks.claim()` writes the reserve *before* the read and `advance()`
+only moves forward: with the shortcut, a three-line journal of good / broken / good
+reserved all 379 bytes without parsing, sip raised, and the next pass found the file
+drunk — the loud failure having eaten both healthy runs behind the bad line.
+
 ### Richness regression gauge (plan §15)
 
 `kura metrics richness` tells "the store stopped remembering lies" apart from "the

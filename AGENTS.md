@@ -177,7 +177,14 @@ empty answer. Do not "clean this up" to one dialect.
 
 - Adding a journal format: subclass `Source` in `sources.py`, register it in `SOURCES`,
   and decide the watermark unit deliberately. Append-only file → byte offset. Anything
-  that gets rewritten → a sequence number carried in the events.
+  that gets rewritten → a sequence number carried in the events. Then place it in
+  `source_for()`'s tuple: that is first-match, `SOURCES` order is irrelevant, and
+  `claude` answers for **any** `.jsonl` — so a new `*.something.jsonl` adapter listed
+  after it is never reached.
+- An adapter whose walk can **raise** must not give `claim_bound` a cheaper rule than
+  the read. `claim()` writes the reserve before `sip()` runs and `advance()` only moves
+  forward, so a bound returned without parsing puts the mark past the corruption the
+  read is about to refuse — and the loud failure eats the healthy runs behind it.
 - The watermark needs **both** halves: `flock` to serialise, and `max()` to merge. A
   lock alone still lets a stale snapshot win.
 - Claim *before* reading, never after. Advance-after-read leaves a window where a

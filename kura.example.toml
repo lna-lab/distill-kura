@@ -176,6 +176,7 @@ gate = 1.0            # honesty bar for the top hit; raise it to make tier zero 
 # Where the raw material comes from. Keys are source adapters:
 #   claude = a directory of Claude Code .jsonl transcripts
 #   dsh    = a DSH sessions directory (session.jsonl.zstd; needs the `zstd` binary)
+#   lna    = an Lna Harness journal directory (`*.lna.jsonl`, one run per line)
 #   text   = a directory of .md/.txt/.log notes
 
 [distill]
@@ -197,7 +198,15 @@ yield_on_return = true      # stop a running track when the journal changes. Set
 [distill.journals]
 claude = "~/.claude/projects/my-project"
 # dsh  = "~/dsh/sessions"
+# lna  = "~/.local/share/lna-harness/journals/v1"
 # text = "~/notes"
+
+# Two harnesses feeding one kura is the ordinary case while a node changes hands: the
+# agent you talk to today and the one taking over from it both leave journals, and the
+# memories should be continuous across the handover.
+# [stores.main.distill.journals]
+# dsh = "~/.dsh/sessions"
+# lna = "~/.local/share/lna-harness/journals/v1"
 
 # ⚠️ With MORE THAN ONE store configured, a store inherits nothing from [distill.journals]
 # unless you say so — feeding two kura from one root distils each mode's conversations
