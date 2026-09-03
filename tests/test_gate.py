@@ -292,11 +292,11 @@ def test_the_manifests_gate_version_and_the_signed_format_string_agree():
 
     assert pipeline.GATE_FORMAT == f"gate-format-v{pipeline.GATE_VERSION}"
     # The version number itself does not move without a deliberate edit here.
-    assert pipeline.GATE_VERSION == 6
-    assert pipeline.GATE_FORMAT == "gate-format-v6"
+    assert pipeline.GATE_VERSION == 7
+    assert pipeline.GATE_FORMAT == "gate-format-v7"
     src = open(pipeline.__file__, encoding="utf-8").read()
     # No second literal may creep back in: the string is built, never typed.
-    assert '"gate-format-v6' not in src and "'gate-format-v6" not in src
+    assert '"gate-format-v7' not in src and "'gate-format-v7" not in src
 
 
 def test_the_index_craft_tells_writers_that_retired_things_wear_it():

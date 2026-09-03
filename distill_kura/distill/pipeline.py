@@ -65,9 +65,12 @@ MIN_DRINK = 6_000            # less raw material than this is not worth a pass
 #   6  the mark signs the whole ENVELOPE — slug, kind, evidence-manifest digest and
 #      body — the judge never judges an unsigned draft, and pour verifies the
 #      manifest's bytes.
+#   7  the surface's LINKS must name memories the store holds (a [[dead-link]] is a
+#      fact about topology, not a matter of taste) and a quotation the surface puts
+#      in quote marks must stand verbatim in the evidence.
 #
 # Routing cues carry their OWN schema version and are never folded into this one.
-GATE_VERSION = 6
+GATE_VERSION = 7
 GATE_FORMAT = f"gate-format-v{GATE_VERSION}"     # derived: the two can no longer drift
 
 
@@ -404,6 +407,16 @@ class Distiller:
                                                            m.group(2).strip(), c.get("topic", "")):
             _log(f"      🌾 a seed came true: {open_seeds[i]['text'][:60]}")
 
+    def _known_slugs(self, own: str = "") -> frozenset[str]:
+        """The names a link may point at: what the store holds, what is already staged
+        as a draft, and the draft's own slug. A `[[link]]` to anything else is a dead
+        end — store topology is a fact, not a judgement, so it is floored, not scored.
+        Drafts count because a batch writes several memories that link to each other,
+        and the one staged a second earlier is about to exist."""
+        staged = {os.path.basename(p)[:-3].split(".")[0]
+                  for p in glob.glob(os.path.join(self.drafts_dir, "*.md"))}
+        return frozenset(self.store.slug_set() | staged | ({own} if own else set()))
+
     # ── ⑤ compose ────────────────────────────────────────────────────────
     def compose(self, c: dict, near: dict | None = None) -> dict | None:
         """`near` is the recall the caller already paid for. run() asks the thinker
@@ -454,7 +467,8 @@ class Distiller:
             cand_ann = " ".join(str(c.get(k) or "") for k in ANNOTATION_KEYS)
             surface = "\n".join([slug.group(1), (title.group(1) if title else ""), text,
                                  " ".join(s_ann.values()), cand_ann])
-            bad = final_surface_violations(surface, c["evidence"], c["classes"])
+            bad = final_surface_violations(surface, c["evidence"], c["classes"],
+                                           known_slugs=self._known_slugs(_safe_slug(slug.group(1))))
             if not bad:
                 break
             if attempt == 2:
@@ -557,7 +571,8 @@ class Distiller:
         # in the CANDIDATE's belongs_because slipped into the memory under the mark.
         cand_ann = " ".join(str(c.get(k) or "") for k in ANNOTATION_KEYS)
         bad = final_surface_violations("\n".join([head, plain, " ".join(s_ann.values()), cand_ann]),
-                                       c["evidence"], c["classes"], allowed=date)
+                                       c["evidence"], c["classes"], allowed=date,
+                                       known_slugs=self._known_slugs(target))
         if bad:
             _log(f"      ✗ extension surface fails the floor: {bad}")
             return None
