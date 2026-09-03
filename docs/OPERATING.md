@@ -250,6 +250,13 @@ recall pays a cold prefill of all of them. Measured 2026-09-03 on a CPU-hybrid m
 (GLM-5.3-Flash, prefill ≈100 tok/s): **279 s cold, 10–18 s warm.** The person who asks
 the next question pays it.
 
+The debounce key is a **signature**: the recall prompt's hash plus the thinker's identity
+(url, model, dialect, template settings, extra). The same index sent to another mouth is a
+cold mouth. A mouth that merely restarted cannot be seen from here — have its service
+manager call `kura warm --force` (e.g. systemd `ExecStartPost=` running a small script that
+waits for the mouth's `/health` and then warms). The track runs after `tidy`, so an index
+the tidy rewrote is warmed once, not twice.
+
 Pay-forward does not cover this. It bakes the *resident map block*, whose bytes are not
 the recall prompt's bytes, so the mouth's prefix cache misses.
 
