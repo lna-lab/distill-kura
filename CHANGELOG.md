@@ -2,6 +2,30 @@
 
 ## 0.3.0 — unreleased
 
+### Two more floors on a composed surface — dead links and invented quotations
+
+Rina's ruling (2026-09-03): "existence, quotation, numbers, attribution are floors;
+whether the advice is good is the writer's competence — do not mix them."
+
+* **Dead-link floor.** Every `[[slug]]` a scribe writes must name a memory the store
+  holds, one already staged as a draft, or the draft's own slug. Unknown ones come
+  back to the scribe once, named exactly (`unknown links: upload-prep, bug-list`); a
+  rewrite that still points nowhere is a compose failure, like any other broken shape.
+  A caller that cannot say which slugs exist passes `known_slugs=None` and nothing is
+  checked — the floor never guesses at topology.
+* **Invented-quotation floor.** A run of at least `MIN_QUOTED` (8) characters inside
+  「」/『』/“”/"" that reads as speech (a space or a CJK character in it) must stand
+  verbatim — NFKC, whitespace collapsed — in the surviving evidence. This catches a
+  reply nobody made, embedded as a quotation. Short scare-quotes and bare JSON tokens
+  in a TAGS line are not testimony and are ignored.
+* **`How to apply` is now optional.** The scribe prompt asked for fact → Why → How to
+  apply as a required shape, which pressured a weak writer to invent a next-time
+  instruction. It is now asked for only when the evidence itself carries a reusable
+  procedure or rule. Whether an instruction follows from the evidence stays the
+  writer's competence — no regex judges it.
+
+`GATE_VERSION` 6 → 7.
+
 ### Richness regression gauge (plan §15)
 
 `kura metrics richness` tells "the store stopped remembering lies" apart from "the

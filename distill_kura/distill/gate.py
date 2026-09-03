@@ -20,8 +20,10 @@ pass a substring check, no matter how confident the model is. Everything downstr
 
 The rest of the module is the same floor applied further downstream, and each part
 carries its own banner: the final-surface floor (`composed_number_violations`,
-`final_surface_violations`, `attributes_to_human`) re-checks every model-written
-surface token by token, for numbers and for crediting the human; `verify_tags` and
+`final_surface_violations`, `attributes_to_human`, `unknown_links`,
+`invented_quotations`) re-checks every model-written surface token by token — for
+numbers, for crediting the human, for links that name no memory and for quotation
+marks around words nobody said; `verify_tags` and
 `verify_callsigns` decide which tags and which routing words the evidence can carry;
 `salvage` recovers whole objects from a truncated JSON answer.
 """
@@ -30,7 +32,7 @@ from __future__ import annotations
 import re
 import unicodedata
 
-from ..store import InvalidTag, normalize_tags
+from ..store import InvalidTag, Store, normalize_tags
 from .sources import Segment
 
 MAX_QUOTE = 400
@@ -195,8 +197,73 @@ def composed_number_violations(text: str, evidence: list[dict], allowed: str = "
     return bad
 
 
+# ── two more facts about a surface: its links and its quotation marks ─────
+#
+# Both are topology, not taste. A `[[slug]]` either names a memory this store
+# holds or it does not — a link to nothing is a dead end the next reader pays
+# for, and no amount of good writing makes it live. A direct quotation either
+# stands in the surviving evidence or it does not: 「はい、反復バグは解決しました」
+# reads as something that was said, and a model that writes a reply nobody made
+# has forged a record. Whether the advice around them is any good is the
+# writer's competence and stays with the writer.
+
+MIN_QUOTED = 8          # shorter runs inside quote marks are emphasis, not testimony
+_QUOTED = re.compile(r"「([^」\n]{1,400})」|『([^』\n]{1,400})』|"
+                     r"“([^”\n]{1,400})”|\"([^\"\n]{1,400})\"")
+
+
+def _qnorm(s: str) -> str:
+    """The one normalisation both quote checks use: NFKC (so ＡＢＣ and full-width
+    punctuation do not disguise a quote) plus collapsed whitespace (so a line break
+    the scribe inserted is not a difference in what was said)."""
+    return norm(unicodedata.normalize("NFKC", s))
+
+
+def _reads_as_speech(body: str) -> bool:
+    """A quoted run is testimony when it has a space or a CJK character in it — the
+    shape of a sentence. Without this the floor read every JSON string in a TAGS line
+    as a quotation nobody uttered."""
+    return " " in body or any("\u3040" <= ch <= "\u9fff" for ch in body)
+
+
+def unknown_links(surface: str, known: frozenset[str] | set[str] | None) -> list[str]:
+    """→ the `[[slug]]` names in `surface` that this store does not hold.
+
+    `known` is the caller's slug set (the store's, plus whatever is being written in
+    the same breath); None means the caller cannot say, and then nothing is checked —
+    a floor that guesses at the topology would refuse honest links.
+    """
+    if known is None:
+        return []
+    bad: list[str] = []
+    for name in Store.links_of(surface):
+        if name not in known and name not in bad:
+            bad.append(name)
+    return bad
+
+
+def invented_quotations(surface: str, evidence: list[dict]) -> list[str]:
+    """→ quoted runs the surface presents as spoken that the evidence never contains.
+
+    Only runs of at least MIN_QUOTED characters inside 「」/『』/“”/"" count, and only ones
+    that read as speech — containing a space or a CJK character. A bare ASCII token in
+    double quotes is a name, a tag or a JSON string ("emotion-carried" in a TAGS line),
+    never testimony; a sentence in quotation marks IS a claim that someone said it, and
+    that claim is checked the way every other claim here is — verbatim against the
+    surviving evidence.
+    """
+    hay = _qnorm(" ".join(str(e.get("text", "")) for e in evidence))
+    bad: list[str] = []
+    for m in _QUOTED.finditer(unicodedata.normalize("NFKC", surface)):
+        body = _qnorm(next(g for g in m.groups() if g is not None))
+        if len(body) < MIN_QUOTED or not _reads_as_speech(body) or body in hay or body in bad:
+            continue
+        bad.append(body)
+    return bad
+
+
 def final_surface_violations(surface: str, evidence: list[dict], classes: list[str],
-                             allowed: str = "") -> list[str]:
+                             allowed: str = "", known_slugs=None) -> list[str]:
     """The one door every model-written surface must pass before it earns a mark.
 
     `surface` is everything that will be stored or indexed: title, description,
@@ -208,6 +275,11 @@ def final_surface_violations(surface: str, evidence: list[dict], classes: list[s
     v = [f"invented number: {t}" for t in composed_number_violations(surface, evidence, allowed)]
     if attributes_to_human(surface, classes):
         v.append("credits the human with no [USER] quote")
+    dead = unknown_links(surface, known_slugs)
+    if dead:
+        v.append("unknown links: " + ", ".join(dead))
+    for q in invented_quotations(surface, evidence):
+        v.append(f"invented quotation: {q[:24]}…")
     return v
 
 

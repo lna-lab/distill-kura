@@ -214,8 +214,11 @@ BELONGS_BECAUSE: <one sentence>
 KEEP: <one sentence>
 MAY_FADE: <one sentence>
 BODY:
-<3-10 lines. The fact → **Why:** why it is worth keeping → **How to apply:** how to
- use it next time. Link related memories as [[their-slug]].>"""
+<3-10 lines. The fact → **Why:** why it is worth keeping. Add **How to apply:** ONLY
+ when the evidence itself contains a reusable procedure or rule — otherwise leave it
+ out; a next-time instruction you had to invent is worse than none. Link related
+ memories as [[their-slug]] — only slugs you were shown; a link to a memory that does
+ not exist is refused. Quote someone only in their own exact words from the evidence.>"""
 
 EXTEND_SYS = """You add ONLY what is newly known to a memory that already exists. Write in {language}.
 

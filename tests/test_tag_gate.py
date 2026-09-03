@@ -144,7 +144,7 @@ def test_tags_and_sentences_travel_from_candidate_to_store(tmp_path):
     # the manifest says why each claiming tag exists, and why one does not
     ref = [l for l in draft.splitlines() if "evidence_manifest:" in l][0].split("sha256:")[1].strip()
     man = json.load(open(os.path.join(store.path, "_evidence", ref + ".json")))
-    assert man["gate_version"] == 6
+    assert man["gate_version"] == 7
     assert man["tags"] == ["decision", "emotion-carried", "entrusted"]
     assert man["tag_evidence"]["entrusted"]["quote"].endswith("remember that")
     assert man["tags_refused"]["expired"] == "reserved for the forgetting pass; a model may not assign it"
