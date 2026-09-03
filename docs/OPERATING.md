@@ -242,6 +242,41 @@ If no slot file exists for the current etag, a `bake-spine` row appears first (t
 pay-forward bake, paid once). Exit 0 unless the mouth is unreachable (1, with the
 reason); the store is never written and the mouth is left warm on the current spine.
 
+## Warming the thinker after the index moves
+
+Recall hands the thinker the whole index. So any change to the index — a pour, a weave,
+a tidy, a memory someone wrote by hand — changes those bytes, and the next thinker-path
+recall pays a cold prefill of all of them. Measured 2026-09-03 on a CPU-hybrid mouth
+(GLM-5.3-Flash, prefill ≈100 tok/s): **279 s cold, 10–18 s warm.** The person who asks
+the next question pays it.
+
+Pay-forward does not cover this. It bakes the *resident map block*, whose bytes are not
+the recall prompt's bytes, so the mouth's prefix cache misses.
+
+```bash
+kura warm            # 0 = warmed, 2 = this index was already warmed (or [warm] is off)
+kura warm --force    # warm again even so
+```
+
+`kura warm` sends exactly what recall would send (one construction, `recall.pick_prompt`,
+so the two cannot drift), asks for **one** token and never reads the answer — the point
+is entirely the mouth's prefix cache. It never raises: a mouth that is down comes back
+as `ok: false` and nothing else stops.
+
+`kura tend` runs it whenever the store's index hash has moved since the last warming.
+The debounce is that hash, kept in `_still/warm.json` so a restart does not re-pay a
+prefill the mouth still holds. **A hand-written change is picked up at the watcher's
+next tick** — deliberately polled, no inotify: the watcher keeps one signal (quiet) and
+one clock. Every attempt appends a row to `_still/warm.jsonl` with the seconds and the
+index hash, so "the mouth is warm" is read off disk, not believed.
+
+```toml
+[warm]
+enabled = true
+question = "この家で最近決めたことと、いま動いている仕事は？"
+# timeout = 900     # must outlast a COLD prefill of the whole index
+```
+
 ## Scheduling by hand, and exit codes
 
 ```bash
@@ -251,6 +286,7 @@ kura distill tidy   # 0 = repaired a line, 2 = index is clean
 kura prefill        # 0 = a current cloth was served, 2 = no cloth or it is stale
 kura pay-forward    # 1 = ANY mouth failed or was busy — retry, even if others worked;
                     # 0 = worked, whole fleet covered; 2 = every mouth VERIFIED fresh
+kura warm           # 0 = warmed the thinker, 2 = this index was already warm / [warm] off
 kura tend --once    # 0 = the requested work completed successfully
                     # 1 = work was attempted or required and did not complete — retry
                     # 2 = honestly nothing to do
