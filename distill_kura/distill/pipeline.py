@@ -39,6 +39,7 @@ from ..store import ANNOTATION_KEYS, FROZEN, Store, normalize_tags
 from . import prompts, transition
 from .gate import (attributes_to_human, composed_number_violations,
                    final_surface_violations, gate, norm, salvage, verify_tags)
+from .pending import MAX_ATTEMPTS, PendingShelf, failure_kind
 from .seeds import Seeds
 from .sources import Segment, as_evidence, discover_all, source_for
 from .watermark import Watermarks
@@ -96,6 +97,19 @@ _HEAD_KEYS = ("EXTENDS", "TITLE", "DESC", "TAGS", "BELONGS_BECAUSE", "KEEP", "MA
 
 
 _HEAD_LINE = re.compile(r"^(" + "|".join(_HEAD_KEYS) + r"):[ \t]*(.*)$")
+
+
+def _is_empty_list(raw: str) -> str | bool:
+    """Is this reply an explicit, parseable empty list? Nothing else counts as the
+    brain saying "there is nothing here" — silence, prose and half a JSON array are
+    all failures, and a failure must not look like a verdict."""
+    t = (raw or "").strip()
+    if t.startswith("```"):                      # a fenced answer is still an answer
+        t = re.sub(r"^```[a-zA-Z]*\s*|\s*```$", "", t).strip()
+    try:
+        return json.loads(t) == []
+    except ValueError:
+        return False
 
 
 def _safe_slug(raw: str) -> str:
@@ -219,6 +233,10 @@ class Distiller:
         self.drafts_dir = _drafts_dir(self.still)
         self.marks = Watermarks(os.path.join(self.still, "watermark.json"))
         self.seeds = Seeds(os.path.join(self.still, "seeds.jsonl"))
+        # The mark moves before the batch is read and is never rolled back, so a batch
+        # the brain never answered lives here until it is drunk for real (pending.py).
+        self.pending = PendingShelf(os.path.join(self.still, "pending"))
+        self.pending_compose = PendingShelf(os.path.join(self.still, "pending-compose"))
         os.makedirs(self.drafts_dir, exist_ok=True)
         self._store_text: str | None = None
 
@@ -252,9 +270,32 @@ class Distiller:
 
     # ── ② spot ───────────────────────────────────────────────────────────
     def spot(self, segs: list[Segment], max_items: int | None = None) -> list[dict]:
+        """The candidates only. A caller that must tell "the brain said nothing here"
+        from "the brain never answered" wants `spot_checked` — this one cannot."""
+        return self.spot_checked(segs, max_items)[0]
+
+    def spot_checked(self, segs: list[Segment],
+                     max_items: int | None = None) -> tuple[list[dict], dict | None]:
+        """`(candidates, failure)`. `failure` is None when the brain actually answered,
+        an explicit empty list included — that is the ONLY valid "nothing here".
+
+        An error and an empty list used to arrive as the same zero candidates, and
+        because the watermark had already moved past this stretch (and must not be
+        rolled back), that stretch was gone for good. The caller shelves the batch on
+        a failure instead; here we only tell the two apart."""
         limit = max_items or self.max_items
-        raw = self.brain(prompts.SPOT_SYS.format(max_items=limit), as_evidence(segs), 5000)
+        try:
+            raw = self.brain(prompts.SPOT_SYS.format(max_items=limit), as_evidence(segs), 5000)
+        except Exception as e:                  # a socket that died mid-read, say
+            return [], {"reason": "transient", "detail": f"{type(e).__name__}: {e}"}
+        err = self.models.brain.last_error      # cleared on every answered call
+        if not (raw or "").strip():
+            detail = err or "the brain answered nothing at all"
+            return [], {"reason": failure_kind(detail) if err else "bad_reply",
+                        "detail": detail}
         found = salvage(raw)[:limit]
+        if not found and not _is_empty_list(raw):
+            return [], {"reason": "bad_reply", "detail": raw.strip()[:200]}
         # A second look, told what the first one already took. One pass optimises for the
         # most striking thing in the batch; the audit asks what it walked past.
         for _ in range(max(0, self.coverage_passes - 1)):
@@ -269,7 +310,7 @@ class Distiller:
                 break
             seen = {c.get("topic") for c in found}
             found += [c for c in more if c.get("topic") not in seen][:limit - len(found)]
-        return found
+        return found, None
 
     # ── ④ novelty ────────────────────────────────────────────────────────
     def novelty(self, c: dict, near: dict) -> tuple[str, str, str | None]:
@@ -405,13 +446,18 @@ class Distiller:
             _log(f"      🌾 a seed came true: {open_seeds[i]['text'][:60]}")
 
     # ── ⑤ compose ────────────────────────────────────────────────────────
-    def compose(self, c: dict, near: dict | None = None) -> dict | None:
+    def compose(self, c: dict, near: dict | None = None,
+                failures: list[str] | None = None) -> dict | None:
         """`near` is the recall the caller already paid for. run() asks the thinker
         once per candidate, for novelty; composing asked again with the same question
         and got the same answer — two model calls for one fact. A caller that has it
-        hands it over; one that does not (a test, the CLI) still gets its own."""
+        hands it over; one that does not (a test, the CLI) still gets its own.
+
+        `failures` is the caller's list: a transport failure of the scribe is appended
+        to it, so `None` with an empty list stays what it always was — a verdict on the
+        answer — and `None` with a reason in it is a candidate worth keeping."""
         if c.get("extends"):
-            return self._compose_extension(c)
+            return self._compose_extension(c, failures)
         ev = _evidence_lines(c["evidence"])
         if near is None:
             near = kura_recall(self.store, self.models.thinker,
@@ -438,6 +484,10 @@ class Distiller:
         # as the candidate's quotes did. One retry with the violations named, then drop.
         for attempt in (1, 2):
             out = self.scribe(prompts.SCRIBE_SYS, user)
+            if out is None and failures is not None:
+                # A transport fact, not a verdict: the caller keeps the candidate and
+                # its evidence for another try instead of losing it to a bad minute.
+                failures.append(self.models.scribe.last_error or "the scribe did not answer")
             if not out:
                 return None
             slug = re.search(r"^SLUG:\s*(.+)$", out, re.M)
@@ -524,7 +574,8 @@ class Distiller:
 
     _DATE_IN_TEXT = re.compile(r"\b(20\d\d)-(\d\d)-(\d\d)\b")
 
-    def _compose_extension(self, c: dict) -> dict | None:
+    def _compose_extension(self, c: dict,
+                           failures: list[str] | None = None) -> dict | None:
         target = c["extends"]
         existing = self.store.read(target)
         if not existing:
@@ -536,6 +587,8 @@ class Distiller:
                           f"The distiller's reading (not evidence): {c.get('extends_why')}\n\n"
                           f"=== ALREADY WRITTEN THERE (do not repeat) ===\n{existing[:9000]}\n\n"
                           f"=== NEW EVIDENCE (this is everything) ===\n{ev}\n")
+        if out is None and failures is not None:
+            failures.append(self.models.scribe.last_error or "the scribe did not answer")
         body = re.search(r"^BODY:\s*\n(.*)$", out or "", re.S | re.M)
         section = re.search(r"^SECTION:\s*(.+)$", out or "", re.M)
         if not body:
@@ -1192,123 +1245,299 @@ class Distiller:
         except OSError:
             pass                        # a metric must never break a pass
 
-    def run(self, session: str | None = None, chunks: int = 1) -> dict:
+    # ── one batch, wherever it came from ─────────────────────────
+    def _process_batch(self, segs: list[Segment], path: str, key: str) -> dict:
+        """Spot → gate → novelty → compose → stage, for segments already in hand.
+
+        Fresh water and a shelved batch go through exactly this, so a retry cannot
+        drift from the first attempt. `failure` in the answer is the brain's, and it is
+        the caller's business — the batch has to be KEPT; everything else is a count of
+        what happened."""
+        self._current_key = key
+        self._current_source = path
         made, killed, covered, sown, recurred = [], 0, 0, 0, 0
-        cue_receipts = cue_receipt_failures = 0
+        cue_receipts = cue_receipt_failures = composes_pending = 0
+        by: dict[str, int] = {}
+        for s in segs:
+            by[s.cls] = by.get(s.cls, 0) + 1
+        raw_chars = sum(len(s.text) for s in segs)
+        _log(f"drink: {key[:40]} → {len(segs)} segments {by}")
+
+        t0 = time.time()
+        cands, failure = self.spot_checked(segs)
+        if failure:
+            # NOT zero candidates: the brain never answered. The mark has already moved
+            # past this stretch and does not come back, so the segments themselves are
+            # what the caller shelves — nothing here may look like a finished batch.
+            _log(f"  ⚠ the brain did not answer ({failure['reason']}): {failure['detail'][:120]}")
+            self._metric({"source_key": key, "segments": len(segs), "by_class": by,
+                          "raw_chars": raw_chars, "pending": failure["reason"],
+                          "pending_detail": failure["detail"][:200]})
+            return {"failure": failure}
+        _log(f"  brain found {len(cands)} candidates ({time.time()-t0:.1f}s)")
+        kept, dropped, ideas = gate(cands, segs, self.store_text())
+        for i in ideas:
+            self.seeds.sow(f"{i.get('topic')} — {i.get('why')}", "brain/spot")
+            _log(f"    🌱 seed: {i.get('topic')} — {str(i.get('why'))[:70]}")
+        sown += len(ideas)
+        killed += len(dropped)
+        for d in dropped:
+            _log(f"    ✗ {d.get('topic')} — {d['why_dropped']}")
+            with open(os.path.join(self.still, "dropped.jsonl"), "a", encoding="utf-8") as f:
+                f.write(json.dumps({**d, "at": datetime.now(timezone.utc).isoformat()},
+                                   ensure_ascii=False) + "\n")
+
+        to_write = []
+        for c in kept:
+            near = kura_recall(self.store, self.models.thinker,
+                               c.get("why") or c["topic"], hops=0, top=3, chars=1200)
+            verdict, why, target = self.novelty(c, near)
+            _log(f"    ○ {c['topic']} [{','.join(c['classes'])}] → {verdict} {target or ''}")
+            if verdict == "COVERED":
+                covered += 1
+                rec = self.recur(c, target, key, path) if target else "no target named"
+                if rec == "tagged":
+                    recurred += 1
+                    _log(f"      ↺ recurred: {target}")
+                elif rec != "already":
+                    _log(f"      · not marked recurred — {rec}")
+                if c.get("routing_cues") and target in self.store.slug_set():
+                    # Memory novelty is COVERED; ROUTING novelty may still be NEW:
+                    # the store already says this, but the human just used a word
+                    # for it the store had never heard. The cue and its provenance
+                    # are recorded against the EXISTING slug (code-chosen, never
+                    # the model's) — and nothing else moves: no memory body, no
+                    # index line, not one canonical byte. The RECEIPT is what makes
+                    # it a route; the manifest alone is provenance, not authority.
+                    mdigest = self._write_manifest(
+                        {"slug": target, "kind": c.get("kind"),
+                         "evidence": c["evidence"], "classes": c["classes"],
+                         "routing_cues": c["routing_cues"],
+                         "routing_cues_refused": c.get("routing_cues_refused") or {}},
+                        path, key)
+                    from ..cues import CueLedger
+                    res = CueLedger(self.store).issue(
+                        memory_slug=target, evidence_manifest=f"sha256:{mdigest}",
+                        routing_cues=c["routing_cues"], accepted_via="covered")
+                    if res["ok"]:
+                        cue_receipts += 1
+                        _log(f"      ⇢ cue kept for COVERED {target}: "
+                             f"{[x['text'] for x in c['routing_cues']]}")
+                    else:
+                        # A route that cannot be minted is silence — but never
+                        # silent ABOUT it: the run's numbers and log both say so.
+                        cue_receipt_failures += 1
+                        _log(f"      ⚠ cue receipt refused for COVERED {target} — "
+                             f"{res['why']}")
+                with open(os.path.join(self.still, "dropped.jsonl"), "a", encoding="utf-8") as f:
+                    f.write(json.dumps({**{k: v for k, v in c.items() if k != "evidence"},
+                                        "why_dropped": f"COVERED by {target}", "reason": why,
+                                        "recurred": rec,
+                                        "at": datetime.now(timezone.utc).isoformat()},
+                                       ensure_ascii=False) + "\n")
+                continue
+            if verdict == "EXTENDS":
+                c = {**c, "extends": target, "extends_why": why}
+            self.sprout(c)
+            to_write.append((c, near))
+
+        drafted, draft_chars, draft_text = [], 0, []
+        if to_write:
+            t1 = time.time()
+            def _one(cn):
+                fails: list[str] = []
+                try:
+                    return cn[0], self.compose(cn[0], cn[1], fails), fails
+                except Exception as ex:      # a transport fact, not a verdict
+                    return cn[0], None, fails + [f"{type(ex).__name__}: {ex}"]
+
+            with ThreadPoolExecutor(max_workers=self.slots) as pool:
+                for c, d, fails in pool.map(_one, to_write):
+                    if not d and fails:
+                        # The scribe was unreachable. The journal behind this candidate
+                        # is past the mark, so the candidate and its evidence packet are
+                        # kept whole for the next pass — the retry unit here is one
+                        # candidate, not the batch.
+                        f = self.pending_compose.save(
+                            {"kind": "compose", "key": key, "path": path,
+                             "candidate": c, "reason": "scribe error",
+                             "detail": fails[0][:200]})
+                        composes_pending += 1
+                        _log(f"      ⚠ the scribe did not answer — kept for a retry "
+                             f"({os.path.basename(f)}): {fails[0][:120]}")
+                        continue
+                    if not d:
+                        _log("      the scribe did not keep the shape")
+                        continue
+                    _log(f"      wrote {d['slug']} → {os.path.basename(self.stage(d, path))}")
+                    made.append(d["slug"])
+                    drafted.append(d["slug"])
+                    draft_chars += len(d.get("body", ""))
+                    draft_text.append(d.get("body", ""))
+            _log(f"      {len(to_write)} composed in {time.time()-t1:.0f}s")
+        self._metric({
+            "source_key": key, "segments": len(segs), "by_class": by,
+            "raw_chars": raw_chars, "raw_tokens_est": estimate(as_evidence(segs)),
+            "candidates": len(cands), "gated_kept": len(kept),
+            "gated_dropped": len(dropped), "ideas": len(ideas),
+            "covered": covered, "recurred": recurred, "drafts": drafted,
+            "cue_receipts": cue_receipts, "cue_receipt_failures": cue_receipt_failures,
+            "draft_chars": draft_chars,
+            "draft_tokens_est": estimate("\n".join(draft_text)),
+            "index_tokens_est": estimate(self.store.index_text()),
+            "composes_pending": composes_pending,
+        })
+        return {"drafts": made, "dropped": killed, "covered": covered, "seeds": sown,
+                "recurred": recurred, "cue_receipts": cue_receipts,
+                "cue_receipt_failures": cue_receipt_failures,
+                "composes_pending": composes_pending, "failure": None}
+
+    # ── the shelf: what a failed call left behind ────────────────────
+    def _work_pending(self) -> dict:
+        """Everything on the two shelves, before any new water is sipped.
+
+        Order matters: sipping first would pile up more shelved batches while the mouth
+        is down, and the oldest water would wait longest for the memory it owes.
+        Nothing is deleted until it has been drunk for real."""
+        out = {"drafts": [], "dropped": 0, "covered": 0, "seeds": 0, "recurred": 0,
+               "cue_receipts": 0, "cue_receipt_failures": 0, "composes_pending": 0,
+               "pending_done": 0, "pending_left": 0}
+        for fp, rec in self.pending.load():
+            if not rec.get("retryable", True):
+                out["pending_left"] += 1
+                continue
+            segs = [Segment(s.get("cls", "SELF"), s.get("text", ""))
+                    for s in (rec.get("segments") or [])]
+            if not segs:
+                self.pending.drop(fp)      # nothing to drink: an empty shelf entry
+                continue
+            _log(f"pending: {os.path.basename(fp)} — {len(segs)} segments, "
+                 f"attempt {rec.get('attempt', 1)} ({rec.get('reason')})")
+            got, left = self._drink_pending(rec, segs)
+            self._add(out, got)
+            self.pending.drop(fp)          # replaced by whatever is still owed
+            for keep in left:
+                self.pending.save(keep)
+            out["pending_left"] += len(left)
+            out["pending_done"] += 0 if left else 1
+        for fp, rec in self.pending_compose.load():
+            if not rec.get("retryable", True):
+                out["pending_left"] += 1
+                continue
+            c = rec.get("candidate") or {}
+            attempt = int(rec.get("attempt", 1)) + 1
+            self._current_key = rec.get("key", "")
+            self._current_source = rec.get("path", "")
+            fails: list[str] = []
+            try:
+                d = self.compose(c, None, fails)
+            except Exception as ex:
+                d, fails = None, fails + [f"{type(ex).__name__}: {ex}"]
+            if d:
+                _log(f"      ↻ composed from the shelf: {d['slug']} → "
+                     f"{os.path.basename(self.stage(d, rec.get('path', '')))}")
+                out["drafts"].append(d["slug"])
+                self.pending_compose.drop(fp)
+                continue
+            if not fails:
+                # The scribe answered and the answer did not hold: a quality verdict,
+                # and repeating it forever would be a loop, not a retry.
+                _log("      ✗ the shelved candidate still does not keep the shape — dropped")
+                self.pending_compose.drop(fp)
+                continue
+            self.pending_compose.save(
+                {**rec, "attempt": attempt, "detail": fails[0][:200],
+                 "retryable": attempt < MAX_ATTEMPTS}, fp)
+            out["composes_pending"] += 1     # counted as pending by run(), once
+            _log(f"      ⚠ the scribe is still down (attempt {attempt}) — kept")
+        return out
+
+    def _drink_pending(self, rec: dict, segs: list[Segment]) -> tuple[dict, list[dict]]:
+        """One shelved batch: what it produced, and what is still owed.
+
+        A context overflow is the one failure retrying cannot fix, so the batch is cut
+        in half ON SEGMENT BOUNDARIES and each half drunk on its own — down to a single
+        segment, which is as small as the material goes. Every other failure is retried
+        whole, a bounded number of times; past that it stays on the shelf, loudly."""
+        got = self._process_batch(segs, rec.get("path", ""), rec.get("key", ""))
+        failure = got.get("failure")
+        if not failure:
+            return got, []
+        attempt = int(rec.get("attempt", 1)) + 1
+        base = {**rec, "segments": [{"cls": s.cls, "text": s.text} for s in segs],
+                "reason": failure["reason"], "detail": failure["detail"][:400],
+                "attempt": attempt}
+        if failure["reason"] == "context_overflow" and len(segs) > 1:
+            half = len(segs) // 2
+            got_l, keep_l = self._drink_pending(rec, segs[:half])
+            got_r, keep_r = self._drink_pending(rec, segs[half:])
+            self._add(got, got_l)
+            self._add(got, got_r)
+            return got, keep_l + keep_r
+        if failure["reason"] == "context_overflow":
+            _log(f"⚠⚠ ONE segment ({len(segs[0].text)} chars) still overflows the brain "
+                 f"— it stays on the shelf until the chunk size comes down: "
+                 f"{failure['detail'][:120]}")
+            return got, [{**base, "retryable": False, "reason": "reduce chunk"}]
+        if attempt > MAX_ATTEMPTS:
+            _log(f"⚠⚠ {MAX_ATTEMPTS} attempts and the brain still will not answer — "
+                 f"the batch stays on the shelf: {failure['detail'][:120]}")
+            return got, [{**base, "retryable": False}]
+        return got, [base]
+
+    @staticmethod
+    def _add(into: dict, more: dict) -> None:
+        """Sum one batch's counts into a pass's. Lists join, numbers add, anything else
+        (the `failure`) belongs to that batch alone and is left where it is."""
+        for k, v in more.items():
+            if isinstance(v, list):
+                into[k] = list(into.get(k) or []) + v
+            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                into[k] = (into.get(k) or 0) + v
+
+    def run(self, session: str | None = None, chunks: int = 1) -> dict:
+        """One pass: the shelf first, then new water.
+
+        The answer says `ok: False` when a batch is left owing — a brain that did not
+        answer is not "nothing to do", and a scheduler that read it as such would sit
+        out its backoff while water it has already reserved waits on the shelf."""
+        tally = self._work_pending()
+        pending_file = pending_reason = None
         for _ in range(chunks):
             got = self.sip_one(session)
             if not got:
                 break
             segs, path, key = got
-            self._current_key = key
-            self._current_source = path
             if not segs:
                 continue
-            by: dict[str, int] = {}
-            for s in segs:
-                by[s.cls] = by.get(s.cls, 0) + 1
-            raw_chars = sum(len(s.text) for s in segs)
-            _log(f"drink: {key[:40]} → {len(segs)} segments {by}")
-
-            t0 = time.time()
-            cands = self.spot(segs)
-            _log(f"  brain found {len(cands)} candidates ({time.time()-t0:.1f}s)")
-            kept, dropped, ideas = gate(cands, segs, self.store_text())
-            for i in ideas:
-                self.seeds.sow(f"{i.get('topic')} — {i.get('why')}", "brain/spot")
-                _log(f"    🌱 seed: {i.get('topic')} — {str(i.get('why'))[:70]}")
-            sown += len(ideas)
-            killed += len(dropped)
-            for d in dropped:
-                _log(f"    ✗ {d.get('topic')} — {d['why_dropped']}")
-                with open(os.path.join(self.still, "dropped.jsonl"), "a", encoding="utf-8") as f:
-                    f.write(json.dumps({**d, "at": datetime.now(timezone.utc).isoformat()},
-                                       ensure_ascii=False) + "\n")
-
-            to_write = []
-            for c in kept:
-                near = kura_recall(self.store, self.models.thinker,
-                                   c.get("why") or c["topic"], hops=0, top=3, chars=1200)
-                verdict, why, target = self.novelty(c, near)
-                _log(f"    ○ {c['topic']} [{','.join(c['classes'])}] → {verdict} {target or ''}")
-                if verdict == "COVERED":
-                    covered += 1
-                    rec = self.recur(c, target, key, path) if target else "no target named"
-                    if rec == "tagged":
-                        recurred += 1
-                        _log(f"      ↺ recurred: {target}")
-                    elif rec != "already":
-                        _log(f"      · not marked recurred — {rec}")
-                    if c.get("routing_cues") and target in self.store.slug_set():
-                        # Memory novelty is COVERED; ROUTING novelty may still be NEW:
-                        # the store already says this, but the human just used a word
-                        # for it the store had never heard. The cue and its provenance
-                        # are recorded against the EXISTING slug (code-chosen, never
-                        # the model's) — and nothing else moves: no memory body, no
-                        # index line, not one canonical byte. The RECEIPT is what makes
-                        # it a route; the manifest alone is provenance, not authority.
-                        mdigest = self._write_manifest(
-                            {"slug": target, "kind": c.get("kind"),
-                             "evidence": c["evidence"], "classes": c["classes"],
-                             "routing_cues": c["routing_cues"],
-                             "routing_cues_refused": c.get("routing_cues_refused") or {}},
-                            path, key)
-                        from ..cues import CueLedger
-                        res = CueLedger(self.store).issue(
-                            memory_slug=target, evidence_manifest=f"sha256:{mdigest}",
-                            routing_cues=c["routing_cues"], accepted_via="covered")
-                        if res["ok"]:
-                            cue_receipts += 1
-                            _log(f"      ⇢ cue kept for COVERED {target}: "
-                                 f"{[x['text'] for x in c['routing_cues']]}")
-                        else:
-                            # A route that cannot be minted is silence — but never
-                            # silent ABOUT it: the run's numbers and log both say so.
-                            cue_receipt_failures += 1
-                            _log(f"      ⚠ cue receipt refused for COVERED {target} — "
-                                 f"{res['why']}")
-                    with open(os.path.join(self.still, "dropped.jsonl"), "a", encoding="utf-8") as f:
-                        f.write(json.dumps({**{k: v for k, v in c.items() if k != "evidence"},
-                                            "why_dropped": f"COVERED by {target}", "reason": why,
-                                            "recurred": rec,
-                                            "at": datetime.now(timezone.utc).isoformat()},
-                                           ensure_ascii=False) + "\n")
-                    continue
-                if verdict == "EXTENDS":
-                    c = {**c, "extends": target, "extends_why": why}
-                self.sprout(c)
-                to_write.append((c, near))
-
-            drafted, draft_chars, draft_text = [], 0, []
-            if to_write:
-                t1 = time.time()
-                with ThreadPoolExecutor(max_workers=self.slots) as pool:
-                    for d in pool.map(lambda cn: self.compose(*cn), to_write):
-                        if not d:
-                            _log("      the scribe did not keep the shape")
-                            continue
-                        _log(f"      wrote {d['slug']} → {os.path.basename(self.stage(d, path))}")
-                        made.append(d["slug"])
-                        drafted.append(d["slug"])
-                        draft_chars += len(d.get("body", ""))
-                        draft_text.append(d.get("body", ""))
-                _log(f"      {len(to_write)} composed in {time.time()-t1:.0f}s")
-            self._metric({
-                "source_key": key, "segments": len(segs), "by_class": by,
-                "raw_chars": raw_chars, "raw_tokens_est": estimate(as_evidence(segs)),
-                "candidates": len(cands), "gated_kept": len(kept),
-                "gated_dropped": len(dropped), "ideas": len(ideas),
-                "covered": covered, "recurred": recurred, "drafts": drafted,
-                "cue_receipts": cue_receipts, "cue_receipt_failures": cue_receipt_failures,
-                "draft_chars": draft_chars,
-                "draft_tokens_est": estimate("\n".join(draft_text)),
-                "index_tokens_est": estimate(self.store.index_text()),
-            })
-        if not made and not killed and not covered and not sown:
+            res = self._process_batch(segs, path, key)
+            self._add(tally, res)
+            failure = res.get("failure")
+            if failure:
+                pending_file = self.pending.save(
+                    {"kind": "batch", "key": key, "path": path,
+                     "start": self.marks.read().get(key, 0),
+                     "segments": [{"cls": s.cls, "text": s.text} for s in segs],
+                     "reason": failure["reason"], "detail": failure["detail"][:400]})
+                pending_reason = failure["reason"]
+                tally["pending_left"] += 1
+                _log(f"  ⇢ the batch is kept for the next pass: "
+                     f"{os.path.basename(pending_file)}")
+                break                      # a mouth that just failed will fail again
+        made = tally["drafts"]
+        answer = {"ok": pending_file is None, "drafts": made,
+                  "dropped": tally["dropped"], "covered": tally["covered"],
+                  "recurred": tally["recurred"], "seeds": tally["seeds"],
+                  "cue_receipts": tally["cue_receipts"],
+                  "cue_receipt_failures": tally["cue_receipt_failures"],
+                  "pending": tally["pending_left"] + tally["composes_pending"]}
+        if pending_file:
+            return {**answer, "why": "brain error", "pending_file": pending_file,
+                    "reason": pending_reason}
+        if not (made or tally["dropped"] or tally["covered"] or tally["seeds"]
+                or tally["pending_left"] or tally["composes_pending"]):
             return {"ok": True, "why": "nothing worth drinking"}
-        return {"ok": True, "drafts": made, "dropped": killed, "covered": covered,
-                "recurred": recurred, "seeds": sown,
-                "cue_receipts": cue_receipts, "cue_receipt_failures": cue_receipt_failures}
+        return answer
 
     def night(self, idle_min: float = 20.0, poll_s: float = 30.0) -> None:
         """Run a pass whenever the journals have been quiet long enough. Never gets in

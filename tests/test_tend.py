@@ -59,10 +59,11 @@ def test_nothing_to_do_is_exit_two_and_a_rest_not_a_spin(tmp_path):
     assert t.proc_track == "distill"                        # no drafts → distil
     t.proc.wait(timeout=120)
     t.reap()
-    # a dead thinker finds no candidates → "nothing worth drinking" → rc 2 → rest
+    # a dead brain is not "nothing worth drinking": the water it reserved is kept on
+    # the shelf and the track reports failure (rc 1) — either way, it rests
     assert t.next_ok["distill"] > time.time() + 19 * 60
     log = open(os.path.join(st.still, "tend.log"), encoding="utf-8").read()
-    assert "nothing to do — resting 20 min" in log
+    assert "resting 20 min" in log
     assert "distill run" not in log or "→ distill" in log   # decisions kept, never /dev/null
     # the next tick does not relaunch the resting track; it moves on to tidy, once
     t.tick(os.path.getmtime(j))
@@ -201,9 +202,10 @@ def test_cli_once_runs_a_tick_and_exits(tmp_path):
     e = {**os.environ, "PYTHONPATH": ROOT}
     p = subprocess.run([sys.executable, "-m", "distill_kura.cli", "-c", cfg, "-s", "m", "tend", "--once"],
                        capture_output=True, text=True, env=e, timeout=300)
-    # The dead thinker leaves no drafts, so the tick did no work — that is exit 2
-    # ("nothing to do"), which the always-0 return used to hide from schedulers.
-    assert p.returncode == 2, p.stderr
+    # The dead thinker leaves no drafts. The always-0 return used to hide that from
+    # schedulers; now the code is honest — 1 because the batch is owed (the brain never
+    # answered and its segments are on the shelf), 2 only when there was nothing there.
+    assert p.returncode in (1, 2), p.stderr
     last = [l for l in p.stdout.splitlines() if l.startswith("{")][-1]
     out = json.loads(last)
     assert out["store"] == "m" and "done" in out
