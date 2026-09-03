@@ -759,6 +759,8 @@ def main(argv: list[str] | None = None) -> int:
         if a.dcmd == "run":
             r = dis.run(a.session, a.chunks)
             print(json.dumps(r, ensure_ascii=False))
+            if not r.get("ok"):
+                return 1        # water is owed, not "nothing to do": a scheduler retries
             return 2 if r.get("why") == "nothing worth drinking" else 0
         if a.dcmd == "sip":
             got = dis.sip_one()
