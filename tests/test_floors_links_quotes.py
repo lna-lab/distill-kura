@@ -74,6 +74,15 @@ def test_a_quotation_the_evidence_does_not_contain_is_caught():
         ["はい、反復バグは解決しました"]
 
 
+def test_double_corner_brackets_are_quotation_marks_too():
+    """The reply that motivated this floor was written in 『』, not 「」 — the house
+    uses both, and a floor that knew only one bracket would have missed the very
+    sentence it exists for."""
+    assert invented_quotations("そして『はい、反復バグは解決しました』と返答し", EV) == \
+        ["はい、反復バグは解決しました"]
+    assert invented_quotations("『put the archive on the slow disk』", EV) == []
+
+
 def test_a_quotation_that_stands_in_the_evidence_passes():
     assert invented_quotations('the human said "put the archive on the slow disk"', EV) == []
     assert invented_quotations("“put the archive on the slow disk”", EV) == []

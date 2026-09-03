@@ -208,7 +208,8 @@ def composed_number_violations(text: str, evidence: list[dict], allowed: str = "
 # writer's competence and stays with the writer.
 
 MIN_QUOTED = 8          # shorter runs inside quote marks are emphasis, not testimony
-_QUOTED = re.compile(r"「([^」\n]{1,400})」|“([^”\n]{1,400})”|\"([^\"\n]{1,400})\"")
+_QUOTED = re.compile(r"「([^」\n]{1,400})」|『([^』\n]{1,400})』|"
+                     r"“([^”\n]{1,400})”|\"([^\"\n]{1,400})\"")
 
 
 def _qnorm(s: str) -> str:
@@ -244,7 +245,7 @@ def unknown_links(surface: str, known: frozenset[str] | set[str] | None) -> list
 def invented_quotations(surface: str, evidence: list[dict]) -> list[str]:
     """→ quoted runs the surface presents as spoken that the evidence never contains.
 
-    Only runs of at least MIN_QUOTED characters inside 「」/“”/"" count, and only ones
+    Only runs of at least MIN_QUOTED characters inside 「」/『』/“”/"" count, and only ones
     that read as speech — containing a space or a CJK character. A bare ASCII token in
     double quotes is a name, a tag or a JSON string ("emotion-carried" in a TAGS line),
     never testimony; a sentence in quotation marks IS a claim that someone said it, and

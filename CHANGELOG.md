@@ -14,7 +14,7 @@ whether the advice is good is the writer's competence — do not mix them."
   A caller that cannot say which slugs exist passes `known_slugs=None` and nothing is
   checked — the floor never guesses at topology.
 * **Invented-quotation floor.** A run of at least `MIN_QUOTED` (8) characters inside
-  「」/“”/"" that reads as speech (a space or a CJK character in it) must stand
+  「」/『』/“”/"" that reads as speech (a space or a CJK character in it) must stand
   verbatim — NFKC, whitespace collapsed — in the surviving evidence. This catches a
   reply nobody made, embedded as a quotation. Short scare-quotes and bare JSON tokens
   in a TAGS line are not testimony and are ignored.
