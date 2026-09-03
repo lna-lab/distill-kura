@@ -104,7 +104,7 @@ def _warm_records_the_hash(t: "Tender", r: dict) -> None:
     """Remember in memory what `warm.py` wrote to disk, so a tick does not have to read
     the state file back to know it just warmed this index."""
     if r.get("did") == "warmed":
-        t._warmed_hash = str(r.get("index_hash") or "")
+        t._warmed_hash = str(r.get("signature") or r.get("index_hash") or "")
 
 
 def _weave_moves_the_map(t: "Tender", r: dict) -> None:
@@ -378,10 +378,10 @@ class Tender:
         if not self.reg.warm_cfg_for(self.store).get("enabled", True):
             return False
         try:
-            now = warmmod.index_hash(self.store)
+            now = warmmod.signature(self.store, self.reg.models_for(self.store).thinker)
         except OSError:
             return False                  # an unreadable store is not a cold mouth
-        return now not in (self._warmed_hash, warmmod.read_state(self.store).get("index_hash"))
+        return now not in (self._warmed_hash, warmmod.read_state(self.store).get("signature"))
 
     def choose(self, now: float) -> str | None:
         drafts = os.path.join(self.store.still, "drafts")
@@ -405,13 +405,14 @@ class Tender:
             # a mouth restart is the systemd hook's job (docs/OPERATING.md), not the
             # watcher's. When the weave changed nothing this is a cheap check → exit 2.
             order.append("payforward")
+        if not self._tidied_this_silence:
+            order.append("tidy")
         if self._thinker_is_cold():
-            # After the map's own chores, and NOT gated on a weave: the index changes
+            # AFTER tidy (Rina, 2026-09-03): tidy rewrites the index, and a warm paid
+            # just before it would be paid twice. NOT gated on a weave: the index moves
             # when a memory is poured, tidied, or written by hand, and every one of
             # those leaves the next human question paying a cold prefill.
             order.append("warm")
-        if not self._tidied_this_silence:
-            order.append("tidy")
         for t in order:
             if now >= self.next_ok[t]:
                 return t

@@ -330,7 +330,9 @@ def test_the_warm_track_is_scheduled_when_the_index_has_moved_and_not_otherwise(
     _only_warm(t)
     now = time.time()
     assert t.choose(now) == "warm"                      # never warmed: cold at start
-    warmmod._write_state(st, {"index_hash": warmmod.index_hash(st), "at": 0, "seconds": 1.0})
+    thinker = reg.models_for(st).thinker
+    warmmod._write_state(st, {"index_hash": warmmod.index_hash(st),
+                              "signature": warmmod.signature(st, thinker), "at": 0, "seconds": 1.0})
     assert t.choose(now) is None                        # this index is already warm
     st.remember("a-memory-written-by-hand", "no weave, no pour — the index still moved", "b")
     assert t.choose(now) == "warm"
@@ -372,7 +374,7 @@ def test_a_successful_warming_is_counted_and_remembered(tmp_path):
     os.utime(j, (old, old))
     t = Tender(reg, st, cfg, idle_min=10)
     _only_warm(t)
-    _stub(t, 0, '{"did": "warmed", "index_hash": "abc123", "seconds": 279.0}')
+    _stub(t, 0, '{"did": "warmed", "index_hash": "abc123", "signature": "abc123", "seconds": 279.0}')
     t.tick(0.0)
     t.proc.wait(timeout=120)
     t.reap()

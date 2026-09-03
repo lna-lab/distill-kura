@@ -1,6 +1,8 @@
 # Changelog
 
-## 0.3.0 — unreleased
+## 0.3.0
+
+- warm: the debounce key is now a *signature* — the recall prompt hash plus the thinker's identity (url, model, dialect, template settings, extra). The cache lives in the mouth, not the store: the same index on another mouth is cold. A mouth that merely restarted is its service manager's job: call `kura warm --force` from an ExecStartPost hook. The warm track now runs AFTER tidy, so a tidy that rewrites the index does not make the watcher pay the cold prefill twice. (Rina, 2026-09-03) — unreleased
 
 ### Warming the thinker after the index moves (`kura warm`)
 

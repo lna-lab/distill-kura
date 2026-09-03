@@ -54,6 +54,21 @@ def index_hash(store: Store) -> str:
     return hashlib.sha256(pick_prompt(store).encode("utf-8")).hexdigest()[:16]
 
 
+def signature(store: Store, thinker: Endpoint | None) -> str:
+    """What the debounce actually compares (Rina, 2026-09-03): the cache lives in the
+    MOUTH, not in the store. The same index sent to another url, another model, or
+    with other template settings is a cold mouth, so the identity of the thinker is
+    part of the key. A mouth that merely restarted cannot be seen from here — that is
+    its service manager's job (`kura warm --force` from an ExecStartPost hook)."""
+    ident = "" if thinker is None else json.dumps(
+        {"url": getattr(thinker, "url", ""), "model": getattr(thinker, "model", ""),
+         "dialect": getattr(thinker, "dialect", ""),
+         "template": thinker.template_kwargs() if hasattr(thinker, "template_kwargs") else {},
+         "extra": getattr(thinker, "extra", {})},
+        sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256((index_hash(store) + "\n" + ident).encode("utf-8")).hexdigest()[:16]
+
+
 def warm_thinker(store: Store, thinker: Endpoint | None, *,
                  question: str = DEFAULT_QUESTION,
                  timeout: float = DEFAULT_TIMEOUT) -> dict:
@@ -120,21 +135,23 @@ def run(reg, store: Store, force: bool = False) -> dict:
     warmed — nothing to do), `disabled`, or `failed`.
     """
     cfg = reg.warm_cfg_for(store)
+    thinker = reg.models_for(store).thinker
     now = index_hash(store)
+    sig = signature(store, thinker)
     if not cfg.get("enabled", True):
         return {"store": store.name, "did": "disabled", "ok": True, "seconds": 0.0,
-                "index_hash": now, "chars": 0, "error": None}
-    if not force and read_state(store).get("index_hash") == now:
+                "index_hash": now, "signature": sig, "chars": 0, "error": None}
+    if not force and read_state(store).get("signature") == sig:
         return {"store": store.name, "did": "fresh", "ok": True, "seconds": 0.0,
-                "index_hash": now, "chars": 0, "error": None}
-    rec = warm_thinker(store, reg.models_for(store).thinker,
+                "index_hash": now, "signature": sig, "chars": 0, "error": None}
+    rec = warm_thinker(store, thinker,
                        question=str(cfg.get("question", DEFAULT_QUESTION)),
                        timeout=float(cfg.get("timeout", DEFAULT_TIMEOUT)))
-    out = {"store": store.name, "did": "warmed" if rec["ok"] else "failed", **rec}
+    out = {"store": store.name, "did": "warmed" if rec["ok"] else "failed", "signature": sig, **rec}
     _ledger(store, {"at": int(time.time()), **out})
     if rec["ok"]:
         # Only a success is remembered: recording a failed hash would tell the next
         # run the mouth is warm when nothing was ever prefilled into it.
-        _write_state(store, {"index_hash": rec["index_hash"], "at": int(time.time()),
-                             "seconds": rec["seconds"]})
+        _write_state(store, {"index_hash": rec["index_hash"], "signature": sig,
+                             "at": int(time.time()), "seconds": rec["seconds"]})
     return out

@@ -200,6 +200,27 @@ model = "none"
     r = json.loads(p.stdout.strip().splitlines()[-1])
     assert p.returncode == 1 and r["did"] == "failed" and r["ok"] is False   # nothing listens on :9
     # Now pretend it worked, and check the fresh path is exit 2 rather than silence.
-    warmmod._write_state(st, {"index_hash": warmmod.index_hash(st), "at": 0, "seconds": 0.0})
+    from distill_kura.thinker import Endpoint
+    same_mouth = Endpoint(url="http://127.0.0.1:9/v1", model="none")
+    warmmod._write_state(st, {"index_hash": warmmod.index_hash(st),
+                              "signature": warmmod.signature(st, same_mouth), "at": 0, "seconds": 0.0})
     p = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, timeout=120)
     assert p.returncode == 2 and json.loads(p.stdout.strip().splitlines()[-1])["did"] == "fresh"
+
+
+def test_the_same_index_on_another_mouth_is_a_cold_mouth(tmp_path):
+    """The cache lives in the mouth, not in the store (Rina, 2026-09-03): the same index
+    sent to another url or model is cold, so the thinker's identity is part of the
+    debounce key. A mouth that merely restarted cannot be seen from here — that is its
+    service manager's `kura warm --force`."""
+    from distill_kura import warm as warmmod
+    from distill_kura.thinker import Endpoint
+    from distill_kura.store import Store
+    st = Store(name="t", path=str(tmp_path / "t")); st.init_files()
+    a = Endpoint(url="http://127.0.0.1:1/v1", model="a")
+    b = Endpoint(url="http://127.0.0.1:1/v1", model="b")
+    c = Endpoint(url="http://127.0.0.1:2/v1", model="a")
+    assert warmmod.signature(st, a) == warmmod.signature(st, a)
+    assert warmmod.signature(st, a) != warmmod.signature(st, b)
+    assert warmmod.signature(st, a) != warmmod.signature(st, c)
+    assert warmmod.index_hash(st) == warmmod.index_hash(st)   # the prompt hash alone is mouth-blind
