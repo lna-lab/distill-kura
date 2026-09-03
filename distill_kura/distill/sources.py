@@ -12,9 +12,14 @@ Injected content (system reminders, runtime context) is not the human speaking. 
 that is detected is adapter-specific, because the harnesses inject differently: see
 the two filters below.
 
-Three adapters ship here; add your own by subclassing `Source` and registering it
+Four adapters ship here; add your own by subclassing `Source` and registering it
 in `SOURCES`. `watermark` semantics differ per adapter, so each one owns them:
 byte offset for append-only files, sequence number for rewritten archives.
+
+Provenance is decided differently in each, and that is the point: Claude Code has no
+label and must drop a whole part that merely CONTAINS an injection marker, DSH has
+`source.kind`, and the Lna Journal carries `origin` — a structured claim about who
+was speaking, which is the only one of the three that can be trusted positively.
 """
 from __future__ import annotations
 
@@ -385,11 +390,193 @@ class TextSource(Source):
         return end, max(0, end - start)
 
 
-SOURCES: dict[str, Source] = {s.name: s for s in (ClaudeCodeSource(), DshSource(), TextSource())}
+# ── Lna Harness journal v1 (append-only JSONL → byte watermark) ─────────────
+
+class LnaJournalSource(Source):
+    """Lna Harness's own journal (`**/*.lna.jsonl`), one JSON *run* per line.
+
+    The record is the J1 projection of one run — caller user message, assistant
+    replies, tool calls and results — with provenance limited to
+    `origin.{rootKind,currentKind,delegated}`. No PrincipalId, no displayName,
+    no reasoning, no deltas: Kura only ever sees what the Journal chose to keep.
+
+    `outcome` is deliberately never read. A run that failed still contains what the
+    human actually said, and their sentence is the primary evidence in it: dropping
+    the run would mean the machine having a bad day erased the person's words. The
+    error prose the assistant wrote about it stays [SELF], and a provider error is
+    not promoted to [TOOL] — a failure is not a measurement.
+
+    Evidence classes, fail-closed on provenance:
+
+        user message, root human, current human, delegated stated false → [USER]
+        any other user message (agent/service/unknown/delegated/unsaid) → [SELF]
+        assistant message                                              → [SELF]
+        tool-call                                                      → [ACT]
+        tool-result                                                    → [TOOL]
+
+    Watermark is a byte offset over an append-only file. A partial final line
+    (no trailing newline) is never treated as read: the walk stops at its start,
+    so both sip() and claim_bound() leave the mark exactly at the last complete
+    line. A completed line that is not valid JSON — or a record with an
+    unsupported v / type — fails loud rather than silently skipping: mistaking a
+    broken journal for drunk is how evidence goes missing forever.
+    """
+    name = "lna"
+
+    def matches(self, path: str) -> bool:
+        return path.endswith(".lna.jsonl")
+
+    def key(self, path: str) -> str:
+        return "lna:" + os.path.abspath(path)
+
+    def discover(self, root: str) -> list[str]:
+        return sorted(glob.glob(os.path.join(root, "**", "*.lna.jsonl"), recursive=True),
+                      key=os.path.getmtime, reverse=True)
+
+    @staticmethod
+    def _class_for_user(origin: dict) -> str:
+        """Fail-closed: only a direct human utterance is [USER]. Everything else —
+        agent, service, unknown, or any delegation — falls to [SELF], never USER.
+
+        `is False`, not `not delegated`. The kind tests demand the exact string
+        "human", so a missing or null field there already falls to SELF; a truthiness
+        test on delegation would have accepted the field's own ABSENCE as proof that
+        no delegation happened. A backfilled projection, which cannot always recover
+        delegation for an old run, writes `"delegated": null` — and that record's
+        agent-composed "approve the retirement of X" would have entered the gate as
+        the human's own words. Provenance is only ever believed when it is stated.
+        """
+        if (origin.get("rootKind") == "human"
+                and origin.get("currentKind") == "human"
+                and origin.get("delegated") is False):
+            return "USER"
+        return "SELF"
+
+    @staticmethod
+    def _json_text(value) -> str:
+        """Stable text for a JSON value (tool arguments / results are not always str)."""
+        if isinstance(value, str):
+            return value
+        return json.dumps(value, ensure_ascii=False) if value is not None else ""
+
+    def _classify(self, d: dict, path: str, line_start: int) -> list[Segment]:
+        """One journal run (one line) → its segments. Invalid records fail loud."""
+        if not isinstance(d, dict):
+            raise RuntimeError(f"lna journal {path}: non-object line at byte {line_start}")
+        if d.get("v") != 1 or d.get("type") != "run":
+            raise RuntimeError(
+                f"lna journal {path}: unsupported record v={d.get('v')!r} "
+                f"type={d.get('type')!r} at byte {line_start}")
+        origin = d.get("origin") or {}
+        if not isinstance(origin, dict):
+            raise RuntimeError(f"lna journal {path}: origin is not an object at byte {line_start}")
+        user_cls = self._class_for_user(origin)
+        segs: list[Segment] = []
+        entries = d.get("entries") or []
+        if not isinstance(entries, list):
+            raise RuntimeError(f"lna journal {path}: entries is not a list at byte {line_start}")
+        for e in entries:
+            if not isinstance(e, dict):
+                continue                      # schema says every entry is an object
+            t = e.get("type")
+            if t == "message":
+                role = e.get("role")
+                if role == "user":
+                    cls = user_cls
+                elif role == "assistant":
+                    cls = "SELF"
+                else:
+                    continue                  # toolResult etc: not in Journal v1 messages
+                txt = self._json_text(e.get("text"))
+            elif t == "tool-call":
+                cls = "ACT"
+                name = self._json_text(e.get("name"))
+                args = self._json_text(e.get("arguments"))
+                txt = f"{name} {args}".strip()
+            elif t == "tool-result":
+                cls = "TOOL"
+                txt = self._json_text(e.get("content"))
+            else:
+                continue                      # unknown entry type is not a Journal v1 entry
+            txt = txt.strip()
+            if not txt:
+                continue                      # empty text yields no segment
+            txt = txt[:_cap(cls)]
+            segs.append(Segment(cls, txt))
+        return segs
+
+    def _walk(self, path: str, start: int, limit_chars: int,
+              collect: bool = True) -> tuple[list[Segment], int, int]:
+        """The one line-walk. sip() and claim_bound() both come through here so the
+        reserved end is exactly where the read stops (the lesson of the earlier
+        sources). A partial final line stops the walk at its own start — the mark
+        never advances past an incomplete run.
+
+        A run is one line; a run is never split across a budget. We fully classify
+        a line, then check the budget.
+
+        `collect=False` keeps the segments out of memory for a caller that only wants
+        the stop offset. Every line is still parsed and classified, so the tally, the
+        stopping rule and the loud failures are identical — the only difference is
+        what is kept. It matters because `catch_up()` bounds the whole file with a
+        budget of 2**40: accumulating a year of segments to be told where the last
+        line ends is the cost the claude adapter dodges with its size shortcut, which
+        this walk cannot have (see `claim_bound`).
+
+        Returns (segments, stop offset, kept chars).
+        """
+        segs: list[Segment] = []
+        total = 0
+        with open(path, "rb") as h:
+            h.seek(start)
+            while True:
+                line_start = h.tell()
+                line = h.readline()
+                if not line:
+                    return segs, line_start, total      # EOF; mark at EOF
+                if not line.endswith(b"\n"):
+                    # Partial final line — the writer may be mid-append. Do NOT
+                    # treat it as read. The mark stays at the last complete line.
+                    return segs, line_start, total
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    raise RuntimeError(
+                        f"lna journal {path}: invalid JSON in a completed line at byte {line_start}")
+                run_segs = self._classify(d, path, line_start)
+                if collect:
+                    segs.extend(run_segs)
+                total += sum(len(s.text) for s in run_segs)
+                if total >= limit_chars:
+                    return segs, h.tell(), total
+
+    def sip(self, path: str, start: int, limit_chars: int) -> tuple[list[Segment], int]:
+        segs, end, _ = self._walk(path, start, limit_chars)
+        return segs, end
+
+    def claim_bound(self, path: str, start: int, budget_chars: int) -> tuple[int, int]:
+        """Always the same walk the read takes — no size shortcut.
+
+        The claude adapter may reserve `size` for a stretch shorter than the budget
+        without parsing, because its walk SKIPS a bad line and therefore always
+        reaches EOF. This walk RAISES on a completed line that is not valid JSON, and
+        `Watermarks.claim()` writes the reserve BEFORE `sip()` ever runs, so the
+        shortcut would strand the mark past the corruption: measured on a
+        three-line journal (good / broken / good), claim reserved all 379 bytes,
+        sip raised, and the next pass found the file fully drunk — the loud failure
+        having eaten the unread human evidence behind it. Parsing twice is the price
+        of a mark that can only move over lines somebody actually read.
+        """
+        _, end, _ = self._walk(path, start, budget_chars, collect=False)
+        return end, max(0, end - start)
+
+
+SOURCES: dict[str, Source] = {s.name: s for s in (ClaudeCodeSource(), DshSource(), TextSource(), LnaJournalSource())}
 
 
 def source_for(path: str) -> Source | None:
-    for s in (SOURCES["dsh"], SOURCES["claude"], SOURCES["text"]):
+    # `lna` must be checked before `claude`: *.lna.jsonl also ends in .jsonl.
+    for s in (SOURCES["dsh"], SOURCES["lna"], SOURCES["claude"], SOURCES["text"]):
         if s.matches(path):
             return s
     return None

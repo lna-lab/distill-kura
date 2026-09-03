@@ -351,7 +351,18 @@ a store actually consumed.
 [distill.journals]
 claude = "~/.claude/projects/my-project"   # Claude Code transcripts (.jsonl)
 dsh    = "~/dsh/sessions"                  # DSH sessions (.jsonl.zstd; needs `zstd`)
+lna    = "~/lna/journals/v1"               # Lna Harness runs (*.lna.jsonl, one per line)
 text   = "~/notes"                         # .md/.txt/.log, all treated as [USER]
+```
+
+Two harnesses may feed one kura at once. That is the ordinary shape while a node changes
+hands: the agent you talk to today and the one taking over from it both leave journals,
+and the memories should be continuous across the handover.
+
+```toml
+[stores.main.distill.journals]
+dsh = "~/.dsh/sessions"
+lna = "~/.local/share/lna-harness/journals/v1"
 ```
 
 Newest journals are drunk first: today's decisions are worth the most. A batch is
@@ -383,7 +394,8 @@ Everything is store-selectable, so one process is normally right. Watch two thin
 
 - **Bind each store to its own journal root.** With more than one store configured,
   nothing inherits `[distill.journals]`; a store with no `[stores.<name>.distill.journals]`
-  drinks nothing, and says so in `kura stores`. This is the whole reason two rooms can
+  drinks nothing. (`kura stores` does not report journal roots — read the config, or
+  watch a store's intake in `kura doctor`.) This is the whole reason two rooms can
   remember two sides of one afternoon: each only ever sees its own conversations. The
   five-room example in `examples/rooms/` shows the shape.
 - **A memory never changes store.** Tags do not move it, a mode change does not move
@@ -421,6 +433,24 @@ number carried in the events for anything that gets rewritten. Then add a key un
 `[distill.journals]`. The evidence classes are the contract — get the mapping right
 (`USER` / `TOOL` / `ACT` / `SELF`, and drop reasoning blocks) and everything downstream
 works unchanged.
+
+Three things bite:
+
+- **`source_for()` is first-match over a hand-ordered tuple, and `SOURCES` order does
+  not matter.** `ClaudeCodeSource.matches` answers for *any* `.jsonl`, so a new adapter
+  whose files also end in `.jsonl` must be listed BEFORE `claude` there or it will never
+  be reached. `lna` (`*.lna.jsonl`) is placed ahead of it for exactly this reason.
+- **A journal kind nobody registered is dropped in silence.** Nothing validates the keys
+  under `[distill.journals]` against the adapter names, and `discover_all` skips a kind
+  it does not recognise. A typo therefore loads cleanly and reads nothing at all; check
+  `kura doctor`'s intake numbers after adding a root rather than assuming it took.
+- **A walk that raises stops the whole intake, not just its own file.** `Watermarks.claim()`
+  iterates every discovered journal in one loop with no per-file guard, so an adapter that
+  fails loud on corruption — `lna` on a completed line that will not parse, `dsh` on an
+  unreadable archive — blocks that store's other journals too until the file is repaired
+  or moved aside. That is the intended direction (filing a corrupt evidence source as
+  drunk is worse), but it is an outage, so it belongs in the runbook: the error names the
+  file and the byte offset.
 
 ## Measuring rather than guessing
 
