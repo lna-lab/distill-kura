@@ -42,9 +42,19 @@ PICK_SYS = (
 _TERMS = re.compile(r"[A-Za-z0-9]{2,}|[ァ-ヴー]{2,}|[一-龠]{2,}")
 
 
+def pick_prompt(store: Store) -> str:
+    """The exact system prompt the thinker is asked to pick with.
+
+    Factored out for `warm.py`: warming the mouth's prefix cache only works when the
+    bytes it prefills are the bytes recall will send. Two copies of this concatenation
+    would drift the first time either side was touched, and the drift is invisible —
+    the warm pass still "succeeds", recall still pays the cold prefill.
+    """
+    return PICK_SYS.format(label=store.label) + store.index_text()
+
+
 def pick_by_meaning(store: Store, thinker: Endpoint, question: str, top: int) -> list[str] | None:
-    raw = thinker.ask(PICK_SYS.format(label=store.label) + store.index_text(), question,
-                      max_tokens=500)
+    raw = thinker.ask(pick_prompt(store), question, max_tokens=500)
     if raw is None:
         return None
     m = re.search(r"\[.*?\]", raw, re.S)

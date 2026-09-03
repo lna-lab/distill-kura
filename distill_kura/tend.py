@@ -11,6 +11,10 @@ What it does, in order, every time the house has been quiet for `idle_min`:
                rebuilt the trail would leave "the current path" empty forever
     payforward after each weave → pay the map's cold prefill into the registered
                mouths (`kura pay-forward`); an unchanged map is a cheap check, exit 2
+    warm       whenever the store's index has moved since the last warming — after a
+               pour, a weave, a tidy, or a memory a person wrote by hand — send the
+               thinker the exact prompt recall sends, so the next question does not
+               pay the cold prefill (279 s measured, `warm.py`)
     tidy       once per silence, only if the index has mechanically ragged lines
 
 "Quiet" is the simplest signal there is: the newest journal file's mtime. No model is
@@ -96,6 +100,13 @@ def _pour_unsettles_the_map(t: "Tender", r: dict) -> None:
         t._woven_this_silence = False            # the map has something new to say
 
 
+def _warm_records_the_hash(t: "Tender", r: dict) -> None:
+    """Remember in memory what `warm.py` wrote to disk, so a tick does not have to read
+    the state file back to know it just warmed this index."""
+    if r.get("did") == "warmed":
+        t._warmed_hash = str(r.get("signature") or r.get("index_hash") or "")
+
+
 def _weave_moves_the_map(t: "Tender", r: dict) -> None:
     t._trailed_this_silence = False              # the map moved: the trail must follow
     t._paid_this_silence = False                 # a fresh weave may have changed the map
@@ -125,6 +136,12 @@ TRACKS: dict[str, Track] = {t.name: t for t in (
           # exactly when the mouth needed warming. The backoff in `reap` is what
           # keeps that retry from spinning.
           raise_on=(0, 2)),
+    Track("warm", ("warm",), tally={"warmed": lambda r: 1 if r.get("did") == "warmed" else 0},
+          # No per-silence flag and no `raise_on`: the debounce is the index hash, and
+          # it is checked in `choose` (below) BEFORE the track is scheduled. A flag
+          # would say "warmed in this quiet" — but the thing that goes cold is an
+          # index that moved, and it can move twice in one silence.
+          after=_warm_records_the_hash),
     Track("tidy", ("distill", "tidy"), tally={"tidied": _count("fixed")},
           flag="_tidied_this_silence"),
 )}
@@ -164,7 +181,8 @@ class Tender:
         self.proc: subprocess.Popen | None = None
         self.proc_track = ""
         self.done = {"poured": 0, "tossed": 0, "fixed": 0, "drafts": 0, "woven": 0,
-                     "trailed": 0, "paid": 0, "tidied": 0}
+                     "trailed": 0, "paid": 0, "warmed": 0, "tidied": 0}
+        self._warmed_hash = ""            # the index this process last warmed the thinker with
         self.new_silence()
 
     def new_silence(self) -> None:
@@ -346,6 +364,25 @@ class Tender:
         t = trail_for(self.store, cfg, loom=loom_for(self.store, cfg))
         return t.text_on_disk() is not None and t.is_stale()
 
+    def _thinker_is_cold(self) -> bool:
+        """Has the index moved since the thinker was last warmed with it?
+
+        Cheap and model-free — a hash of the prompt recall would send, compared with
+        `_still/warm.json` (so a restart does not re-pay a prefill the mouth still
+        holds) and with this process's own last warming. Deliberately polled on the
+        watcher's existing tick rather than watched with inotify: a memory a person
+        writes by hand is picked up at the next tick, and the watcher keeps one signal
+        and one clock.
+        """
+        from . import warm as warmmod
+        if not self.reg.warm_cfg_for(self.store).get("enabled", True):
+            return False
+        try:
+            now = warmmod.signature(self.store, self.reg.models_for(self.store).thinker)
+        except OSError:
+            return False                  # an unreadable store is not a cold mouth
+        return now not in (self._warmed_hash, warmmod.read_state(self.store).get("signature"))
+
     def choose(self, now: float) -> str | None:
         drafts = os.path.join(self.store.still, "drafts")
         have_drafts = any(f.endswith(".md") for f in os.listdir(drafts)) if os.path.isdir(drafts) else False
@@ -370,6 +407,12 @@ class Tender:
             order.append("payforward")
         if not self._tidied_this_silence:
             order.append("tidy")
+        if self._thinker_is_cold():
+            # AFTER tidy (Rina, 2026-09-03): tidy rewrites the index, and a warm paid
+            # just before it would be paid twice. NOT gated on a weave: the index moves
+            # when a memory is poured, tidied, or written by hand, and every one of
+            # those leaves the next human question paying a cold prefill.
+            order.append("warm")
         for t in order:
             if now >= self.next_ok[t]:
                 return t

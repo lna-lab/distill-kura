@@ -66,6 +66,7 @@ def test_nothing_to_do_is_exit_two_and_a_rest_not_a_spin(tmp_path):
     assert "resting 20 min" in log
     assert "distill run" not in log or "→ distill" in log   # decisions kept, never /dev/null
     # the next tick does not relaunch the resting track; it moves on to tidy, once
+    t.next_ok["warm"] = time.time() + 9999      # not this test's subject
     t.tick(os.path.getmtime(j))
     assert t.proc_track == "tidy"
     t.proc.wait(timeout=120); t.reap()
@@ -102,7 +103,7 @@ def test_work_is_counted_and_launches_are_not(tmp_path):
     reg, st, cfg, j = build(tmp_path)
     t = Tender(reg, st, cfg, idle_min=10)
     assert set(t.done) == {"poured", "tossed", "fixed", "drafts", "woven",
-                           "trailed", "paid", "tidied"}
+                           "trailed", "paid", "warmed", "tidied"}
     assert not any(k.endswith("_runs") or "launch" in k for k in t.done)
 
 
@@ -113,7 +114,7 @@ def test_payforward_is_scheduled_after_a_weave_and_only_then(tmp_path):
     reg, st, cfg, j = build(tmp_path)
     t = Tender(reg, st, cfg, idle_min=10)
     now = time.time()
-    for track in ("drain", "distill", "tidy"):
+    for track in ("drain", "distill", "warm", "tidy"):
         t.next_ok[track] = now + 9999           # only the question at hand remains
     assert t.choose(now) is None                # no weave yet → no payforward
     t._woven_this_silence = True
@@ -144,7 +145,7 @@ def test_a_pour_does_not_leave_the_trail_absent_forever(tmp_path):
     st.remember_direct("poured-while-watching", "a memory poured in the quiet", "body")
     assert trail_for(st, cfgp, loom=loom_for(st, cfgp)).is_stale() is True
     now = time.time()
-    for track in ("drain", "distill", "tidy"):
+    for track in ("drain", "distill", "warm", "tidy"):
         t.next_ok[track] = now + 9999
     t._woven_this_silence = True                # the weave that follows a pour
     assert t.choose(now) == "trail"
@@ -166,7 +167,7 @@ def test_a_trail_past_its_own_horizon_is_rebuilt_in_the_quiet(tmp_path):
     json.dump(sv, open(tr.state_path, "w"))
     t = Tender(reg, st, cfg, idle_min=10)
     now = time.time()
-    for track in ("drain", "distill", "tidy"):
+    for track in ("drain", "distill", "warm", "tidy"):
         t.next_ok[track] = now + 9999
     assert t.choose(now) == "trail"
 
@@ -177,7 +178,7 @@ def test_an_absent_trail_is_not_a_per_chore(tmp_path):
     reg, st, cfg, j = build(tmp_path)
     t = Tender(reg, st, cfg, idle_min=10)
     now = time.time()
-    for track in ("drain", "distill", "tidy"):
+    for track in ("drain", "distill", "warm", "tidy"):
         t.next_ok[track] = now + 9999
     assert t.choose(now) is None, "an absent trail is honest absence, not a chore"
 
@@ -261,7 +262,7 @@ def _stub(t, rc, out=""):
 def _only_payforward(t):
     """Rest every other track and put the silence one weave-and-trail in, so choose()
     has exactly one question left: does the map still need paying forward?"""
-    for track in ("drain", "distill", "tidy", "trail"):
+    for track in ("drain", "distill", "tidy", "trail", "warm"):
         t.next_ok[track] = time.time() + 9999
     t._woven_this_silence = True
     t._trailed_this_silence = True
@@ -314,6 +315,72 @@ def test_a_fresh_or_successful_payforward_is_not_retried_in_the_same_silence(tmp
         assert t.proc is None, f"rc={rc} must not run twice in one silence"
 
 
+def _only_warm(t):
+    for track in ("drain", "distill", "tidy", "trail", "weave", "payforward"):
+        t.next_ok[track] = time.time() + 9999
+
+
+def test_the_warm_track_is_scheduled_when_the_index_has_moved_and_not_otherwise(tmp_path):
+    """The debounce is the index hash, checked before the track is scheduled — a pour,
+    a tidy or a memory written by hand all move it, and every one of them leaves the
+    next human question paying a cold prefill (279 s measured 2026-09-03)."""
+    from distill_kura import warm as warmmod
+    reg, st, cfg, j = build(tmp_path)
+    t = Tender(reg, st, cfg, idle_min=10)
+    _only_warm(t)
+    now = time.time()
+    assert t.choose(now) == "warm"                      # never warmed: cold at start
+    thinker = reg.models_for(st).thinker
+    warmmod._write_state(st, {"index_hash": warmmod.index_hash(st),
+                              "signature": warmmod.signature(st, thinker), "at": 0, "seconds": 1.0})
+    assert t.choose(now) is None                        # this index is already warm
+    st.remember("a-memory-written-by-hand", "no weave, no pour — the index still moved", "b")
+    assert t.choose(now) == "warm"
+
+
+def test_a_switched_off_warmer_is_never_scheduled(tmp_path):
+    reg, st, cfg, j = build(tmp_path)
+    cfg2 = str(tmp_path / "off.toml")
+    open(cfg2, "w", encoding="utf-8").write(
+        open(cfg, encoding="utf-8").read() + '\n[warm]\nenabled = false\n')
+    reg2 = Registry.load(cfg2)
+    t = Tender(reg2, reg2.store("m"), cfg2, idle_min=10)
+    _only_warm(t)
+    assert t.choose(time.time()) is None
+
+
+def test_a_warming_that_failed_does_not_stop_the_watcher(tmp_path):
+    """The mouth is down. That is a measurement, not a fault: the track rests like any
+    other and the next tick goes on to the rest of the work."""
+    reg, st, cfg, j = build(tmp_path, backoff_min=20)
+    old = time.time() - 3600
+    os.utime(j, (old, old))
+    t = Tender(reg, st, cfg, idle_min=10)
+    _only_warm(t)
+    _stub(t, 1)
+    stamp = t.tick(0.0)
+    assert t.proc_track == "warm"
+    t.proc.wait(timeout=120)
+    t.reap()
+    assert t.done["warmed"] == 0                        # a failure is not work
+    assert t.next_ok["warm"] > time.time() + 19 * 60    # rests, does not spin
+    t.tick(stamp)
+    assert t.proc is None
+
+
+def test_a_successful_warming_is_counted_and_remembered(tmp_path):
+    reg, st, cfg, j = build(tmp_path, backoff_min=20)
+    old = time.time() - 3600
+    os.utime(j, (old, old))
+    t = Tender(reg, st, cfg, idle_min=10)
+    _only_warm(t)
+    _stub(t, 0, '{"did": "warmed", "index_hash": "abc123", "signature": "abc123", "seconds": 279.0}')
+    t.tick(0.0)
+    t.proc.wait(timeout=120)
+    t.reap()
+    assert t.done["warmed"] == 1 and t._warmed_hash == "abc123"
+
+
 def test_a_weave_that_wrote_nothing_does_not_pass_for_a_woven_map(tmp_path):
     """`weave` exits 2 when the index moved under it and nothing was written. That is
     a re-weave signal, not a new map — the trail and the mouths must not be sent off
@@ -355,7 +422,8 @@ def test_a_track_is_declared_in_exactly_one_place(tmp_path):
     could be right in three places and wrong in the fourth."""
     reg, st, cfg, j = build(tmp_path)
     t = Tender(reg, st, cfg)
-    assert list(TRACKS) == ["drain", "distill", "weave", "trail", "payforward", "tidy"]
+    assert list(TRACKS) == ["drain", "distill", "weave", "trail", "payforward",
+                            "warm", "tidy"]
     for name, tr in TRACKS.items():
         assert tr.name == name
         assert t._cmd(name)[-len(tr.argv):] == list(tr.argv)   # the command

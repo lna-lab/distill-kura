@@ -57,6 +57,7 @@ With no config at all, `$KURA_DIR` (or `./memory`) becomes a single store named
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 
@@ -66,14 +67,21 @@ from .prefill import RESIDENT_MODES
 
 CONFIG_CANDIDATES = ("kura.toml", os.path.expanduser("~/.config/distill-kura/kura.toml"))
 
+# What an AUTO-PROVISIONED store may be called. A caller-supplied name becomes a
+# directory under `[server] auto_store_root`, so it must be a single safe path
+# component: no separators, no dots (a dot can never survive this alphabet), no
+# leading/trailing dash. Configured stores and modes are checked first and win,
+# so auto-provisioning can never shadow them.
+_STORE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$")
+
 # Keys a [stores.<name>] table may carry. Anything else is a typo until proven
 # otherwise; extensions use an `x_` prefix so they are visibly not ours.
 STORE_KEYS = {"path", "label", "readonly", "write_policy", "persona", "charter",
               "model_profile"}
-NESTED_KEYS = {"distill", "prefill", "fastpath"}
+NESTED_KEYS = {"distill", "prefill", "fastpath", "warm"}
 _TYPES = {"path": str, "label": str, "readonly": bool, "write_policy": str,
           "persona": str, "charter": str, "model_profile": str,
-          "distill": dict, "prefill": dict, "fastpath": dict}
+          "distill": dict, "prefill": dict, "fastpath": dict, "warm": dict}
 # The nested tables need checking too: `inherit_global_journals = "false"` is a STRING,
 # therefore truthy, so a store inherited the global intake it had explicitly declined.
 _DISTILL_TYPES = {"inherit_global_journals": bool, "journals": dict, "language": str,
@@ -96,6 +104,10 @@ _PREFILL_TYPES = {"window_tokens": int, "budget_fraction": float, "hard_fraction
 # Tier zero of recall (`fastpath.py`). `gate` is the honesty bar: a hit below it is
 # silence, and silence goes to the thinker.
 _FASTPATH_TYPES = {"enabled": bool, "gate": (int, float), "cues": bool}
+# Warming the thinker after the index moves (`warm.py`). `question` is the probe whose
+# answer is never read; `timeout` must outlast a cold prefill of the whole index (279 s
+# measured 2026-09-03), which is why it is not the thinker's own 120 s default.
+_WARM_TYPES = {"enabled": bool, "question": str, "timeout": (int, float)}
 # One mouth `kura pay-forward` bakes the resident map into (`payforward.py`). `url` is
 # the llama.cpp-compatible server's BASE — the slots API lives beside /v1, not under it
 # — and `store` names whose map the mouth wears.
@@ -222,6 +234,8 @@ def _check_types(name: str, sc: dict) -> None:
     _check_prefill(f"stores.{name}.prefill", sc.get("prefill") or {})
     _check_unknown(f"stores.{name}.fastpath", sc.get("fastpath") or {}, _FASTPATH_TYPES)
     _check_table(f"stores.{name}.fastpath", sc.get("fastpath") or {}, _FASTPATH_TYPES)
+    _check_unknown(f"stores.{name}.warm", sc.get("warm") or {}, _WARM_TYPES)
+    _check_table(f"stores.{name}.warm", sc.get("warm") or {}, _WARM_TYPES)
 
 
 def _real(path: str) -> str:
@@ -394,6 +408,12 @@ class Registry:
     host: str = "127.0.0.1"
     port: int = 8085
     config_path: str | None = None
+    # Where a store NOT declared in kura.toml may be auto-provisioned on first use.
+    # None = strict default: an unknown store is an error, never created.
+    auto_store_root: str | None = None
+    # Names auto-provisioned under auto_store_root — distinguished from CONFIGURED
+    # stores so the "never shadow a configured store" guard stays honest.
+    auto_stores: set[str] = field(default_factory=set)
     raw: dict = field(default_factory=dict)
 
     # ── loading ──────────────────────────────────────────────────────────
@@ -441,6 +461,8 @@ class Registry:
         _check_prefill("prefill", raw.get("prefill") or {})
         _check_unknown("fastpath", raw.get("fastpath") or {}, _FASTPATH_TYPES)
         _check_table("fastpath", raw.get("fastpath") or {}, _FASTPATH_TYPES)
+        _check_unknown("warm", raw.get("warm") or {}, _WARM_TYPES)
+        _check_table("warm", raw.get("warm") or {}, _WARM_TYPES)
         srv = raw.get("server") or {}
         default = srv.get("default") or next(iter(stores))
         if default not in stores:
@@ -500,11 +522,16 @@ class Registry:
             port = int(port_raw)
         else:
             port = port_raw
+        auto_root = srv.get("auto_store_root")
+        if auto_root is not None and not isinstance(auto_root, str):
+            raise ValueError(f"[server] auto_store_root must be a path string, "
+                             f"got {type(auto_root).__name__} ({auto_root!r})")
         return cls(stores=stores, modes=modes, models=Models.from_config(models_cfg),
                    profiles=profiles,
                    default=default, host=srv.get("host", "127.0.0.1"),
                    port=port,
-                   config_path=path, raw=raw)
+                   config_path=path, raw=raw,
+                   auto_store_root=os.path.expanduser(auto_root) if auto_root else None)
 
     # ── lookups ──────────────────────────────────────────────────────────
     def store(self, name: str | None = None) -> Store:
@@ -532,6 +559,31 @@ class Registry:
             return self.store(mode)
         except KeyError:
             return self.stores[self.default]
+
+    def ensure_store(self, name: str) -> Store | None:
+        """Auto-provision a store that kura.toml does not declare, under
+        `[server] auto_store_root` — or None when that is not possible.
+
+        This is the deliberate, opt-in exception to "an unknown store is an error":
+        a host that routes the working directory to a logical store (an OpenCode
+        plugin) needs the store to exist on first use. The store is created on disk
+        (`init_files`) and held in memory; kura.toml is never rewritten. A store that
+        IS configured, or a name that is not a single safe path component, is never
+        created — the caller keeps the strict error instead."""
+        if not self.auto_store_root or not name:
+            return None
+        # Never shadow a configured store or a mode.
+        if name in self.modes or name in self.raw.get("stores", {}):
+            return None
+        if name in self.auto_stores:
+            return self.stores[name]
+        if not _STORE_NAME.match(name):
+            return None
+        st = Store(name=name, path=os.path.join(self.auto_store_root, name))
+        st.init_files()
+        self.stores[name] = st
+        self.auto_stores.add(name)
+        return st
 
     def models_for(self, store: Store) -> Models:
         """The model roles THIS store may use.
@@ -613,6 +665,9 @@ class Registry:
 
     def fastpath_cfg_for(self, store: Store) -> dict:
         return self._cfg_for(store, "fastpath")
+
+    def warm_cfg_for(self, store: Store) -> dict:
+        return self._cfg_for(store, "warm")
 
     def describe(self) -> dict:
         return {

@@ -156,6 +156,25 @@ gate = 1.0            # honesty bar for the top hit; raise it to make tier zero 
 # [stores.eq.fastpath]
 # enabled = false
 
+# ── warm the thinker after the index moves ──────────────────────────────────
+# Any change to the index — a pour, a weave, a tidy, a memory written by hand — changes
+# the prompt recall hands the thinker, so the next recall pays a cold prefill of the
+# whole thing. Measured 2026-09-03 on a CPU-hybrid mouth: 279 s cold, 10-18 s warm.
+# `kura warm` sends EXACTLY the prompt recall would send, asks for one token and throws
+# the answer away; the point is the mouth's prefix cache. `kura tend` runs it whenever
+# the index hash has moved (its own tick — no inotify: a hand-written memory is picked
+# up at the next tick). Pay-forward does NOT cover this: it bakes the resident map
+# block, whose bytes are not the recall prompt's bytes.
+
+[warm]
+enabled = true
+question = "この家で最近決めたことと、いま動いている仕事は？"
+# timeout = 900       # must outlast a COLD prefill of the whole index
+
+# Per-store overrides work here too:
+# [stores.eq.warm]
+# enabled = false
+
 # ── pay it forward ──────────────────────────────────────────────────────────
 # Bake the resident map into a slow mouth's KV cache in the quiet hours, so the first
 # turn after a re-weave — or a mouth restart — is warm. The mouth is a llama.cpp
