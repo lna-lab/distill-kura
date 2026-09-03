@@ -58,7 +58,7 @@ def test_dsh_cuts_a_tool_result_at_max_tool_and_prose_at_max_seg(monkeypatch, tm
     assert len(segs[0].text) == MAX_TOOL
     assert len(segs[1].text) == MAX_SEG
     # the reserve counts the CLIPPED lengths, the same numbers the read kept
-    assert src.claim_bound(path, 0, 10 ** 6) == (last, MAX_TOOL + MAX_SEG)
+    assert src.claim_bound(path, 0, 10 ** 6) == (last, MAX_TOOL + MAX_SEG, 0)
 
 
 def test_claude_drops_a_reminder_appended_inside_the_humans_own_text(tmp_path):

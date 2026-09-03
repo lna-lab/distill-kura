@@ -830,6 +830,10 @@ def main(argv: list[str] | None = None) -> int:
             if not got:
                 print("nothing worth drinking")
                 return 2
+            from .distill.pipeline import SipPending
+            if isinstance(got, SipPending):
+                print(f"{got.key}: bounded discard in progress ({got.scan_pending_bytes} bytes), nothing drunk yet")
+                return 2
             segs, path, key = got
             by: dict[str, int] = {}
             for s in segs:

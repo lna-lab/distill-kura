@@ -93,7 +93,7 @@ def test_dsh_claim_reserves_exactly_what_sip_reads(tmp_path, monkeypatch):
         c = wm.claim([path], budget, 1)
         if not c:
             break
-        _, claimed_start, s = c
+        claimed_start, s = c.start, c.source
         assert claimed_start == start
         segs, nxt = s.sip(path, start, budget)
         rounds += 1

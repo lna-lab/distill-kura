@@ -216,6 +216,7 @@ yield_on_return = true      # stop a running track when the journal changes. Set
 
 [distill.journals]
 claude = "~/.claude/projects/my-project"
+# evidence = "~/journals"   # classified .evidence.jsonl (USER/SELF/ACT/TOOL)
 # dsh  = "~/dsh/sessions"
 # lna  = "~/.local/share/lna-harness/journals/v1"
 # text = "~/notes"

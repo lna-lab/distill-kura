@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from .distill.gate import gate
 from .distill.pipeline import MIN_DRINK, Distiller
 from .distill.prompts import DEFAULT_CHARTER
-from .distill.sources import source_for
+from .distill.sources import call_claim_bound, call_sip, source_for
 from .recall import recall as kura_recall
 from .thinker import Endpoint, Models
 
@@ -148,10 +148,13 @@ def _selected_chunk(distiller: Distiller, positions: dict[str, int], session: st
             continue
         key = src.key(path)
         start = positions.get(key, distiller.marks.read().get(key, 0))
-        end, approx = src.claim_bound(path, start, distiller.chunk_chars)
-        if approx < MIN_DRINK or end <= start:
+        # 3-value claim (end, approx, scan_pending) since the evidence source landed (PR #5);
+        # call_* normalise legacy 2-value adapters. A bounded discard in progress is skipped
+        # here — freezing must not drink through an oversized line.
+        end, approx, scan_pending = call_claim_bound(src, path, start, distiller.chunk_chars)
+        if scan_pending or approx < MIN_DRINK or end <= start:
             continue
-        segs, nxt = src.sip(path, start, distiller.chunk_chars)
+        segs, nxt = call_sip(src, path, start, distiller.chunk_chars, bound_end=end)
         positions[key] = nxt
         return segs, path, key
     return None

@@ -445,7 +445,7 @@ def _drain(src, path, marks_path, budget, rounds=4000):
         c = wm.claim([path], budget, 1)
         if not c:
             return got, stretches
-        _, start, s = c
+        start, s = c.start, c.source          # Watermarks.claim() returns a Claim (PR #5)
         segs, stop = s.sip(path, start, budget)
         wm.advance(s.key(path), stop)
         got += segs
@@ -490,7 +490,7 @@ def test_partial_line_during_drain_stops_watermark_then_recovers(tmp_path):
     wm = Watermarks(marks)
     # drain once: reads the 20 complete runs, stops before the partial line
     c = wm.claim([path], 1 << 30, 1)
-    _, start, s = c
+    start, s = c.start, c.source          # Claim (PR #5)
     segs, stop = s.sip(path, start, 1 << 30)
     wm.advance(s.key(path), stop)
     assert len(segs) == 20
@@ -502,7 +502,7 @@ def test_partial_line_during_drain_stops_watermark_then_recovers(tmp_path):
         f.write(',"role":"user","text":"late"}]}\n'.encode("utf-8"))
     # next drain reads exactly r20
     c = wm.claim([path], 1 << 30, 1)
-    _, start2, s2 = c
+    start2, s2 = c.start, c.source        # Claim (PR #5)
     segs2, stop2 = s2.sip(path, start2, 1 << 30)
     assert [sg.text for sg in segs2] == ["late"]
     wm.advance(s2.key(path), stop2)
