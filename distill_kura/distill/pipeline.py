@@ -469,8 +469,50 @@ class Distiller:
         `failures` is the caller's list: a transport failure of the scribe is appended
         to it, so `None` with an empty list stays what it always was — a verdict on the
         answer — and `None` with a reason in it is a candidate worth keeping."""
+        return self._compose_with_call(c, near, failures, self.scribe,
+                                       self.models.scribe)
+
+    def _scribe_endpoint(self, endpoint, task: str, user: str,
+                         max_tokens: int = 1400) -> str | None:
+        """Ask one explicitly selected scribe.
+
+        The writer bench needs several scribes to face the same packet. Mutating
+        `self.models.scribe` would make parallel rows race, while copying compose's
+        floors into the bench would let them drift. This tiny call seam keeps one
+        compose implementation and changes only who answers it."""
+        return endpoint.ask(self._sys(task.format(language=self.language)), user,
+                            max_tokens=max_tokens, timeout=3600)
+
+    def compose_with(self, c: dict, scribe, near: dict | None = None,
+                     failures: list[str] | None = None,
+                     known_slugs=None, observations: list[dict] | None = None) -> dict | None:
+        """Compose with a supplied endpoint while retaining production's floors.
+
+        A benchmark freezes `known_slugs` with its packet. Without that snapshot a
+        store changing between writer rows would make a dead link live for one writer
+        and dead for another, turning a paired comparison into two different tests.
+        `observations` is diagnostic output only: the floor decisions still happen in
+        `_compose_with_call`, the same place production makes them."""
+        call = lambda task, user: self._scribe_endpoint(scribe, task, user)
+        return self._compose_with_call(c, near, failures, call, scribe,
+                                       known_slugs=known_slugs,
+                                       observations=observations)
+
+    def _compose_with_call(self, c: dict, near: dict | None,
+                           failures: list[str] | None, scribe_call,
+                           error_endpoint, known_slugs=None,
+                           observations: list[dict] | None = None) -> dict | None:
+        """The single compose body used by the live pipeline and writer bench.
+
+        The previous comparison prototype copied this code and checked only numbers;
+        a writer could then win by inventing a link or a quotation. Keeping the
+        observer beside the real decision records every floor without making a second
+        interpretation of the model's surface."""
         if c.get("extends"):
-            return self._compose_extension(c, failures)
+            return self._compose_extension(c, failures, scribe_call=scribe_call,
+                                           error_endpoint=error_endpoint,
+                                           known_slugs=known_slugs,
+                                           observations=observations)
         ev = _evidence_lines(c["evidence"])
         if near is None:
             near = kura_recall(self.store, self.models.thinker,
@@ -496,11 +538,16 @@ class Distiller:
         # The scribe is a model: its finished text gets the same deterministic floor
         # as the candidate's quotes did. One retry with the violations named, then drop.
         for attempt in (1, 2):
-            out = self.scribe(prompts.SCRIBE_SYS, user)
+            out = scribe_call(prompts.SCRIBE_SYS, user)
             if out is None and failures is not None:
                 # A transport fact, not a verdict: the caller keeps the candidate and
                 # its evidence for another try instead of losing it to a bad minute.
-                failures.append(self.models.scribe.last_error or "the scribe did not answer")
+                failures.append(getattr(error_endpoint, "last_error", "")
+                                or "the scribe did not answer")
+            if out is None or not out:
+                if observations is not None:
+                    observations.append({"attempt": attempt, "shape": True,
+                                         "surface": out or "", "violations": []})
             if not out:
                 return None
             slug = re.search(r"^SLUG:\s*(.+)$", out, re.M)
@@ -508,6 +555,9 @@ class Distiller:
             desc = re.search(r"^DESC:\s*(.+)$", out, re.M)
             body = re.search(r"^BODY:\s*\n(.*)$", out, re.S | re.M)
             if not (slug and desc and body):
+                if observations is not None:
+                    observations.append({"attempt": attempt, "shape": True,
+                                         "surface": out, "violations": []})
                 return None
             text = desc.group(1) + "\n" + body.group(1)
             # The floor sees everything that will be stored or indexed: the title
@@ -517,8 +567,17 @@ class Distiller:
             cand_ann = " ".join(str(c.get(k) or "") for k in ANNOTATION_KEYS)
             surface = "\n".join([slug.group(1), (title.group(1) if title else ""), text,
                                  " ".join(s_ann.values()), cand_ann])
+            topology = (set(known_slugs) if known_slugs is not None
+                        else set(self._known_slugs(_safe_slug(slug.group(1)))))
+            # The output's own slug is code-chosen and is live in the same breath. A
+            # frozen packet supplies the rest of the topology; omitting this one
+            # mechanical member would reject a self-link that production accepts.
+            topology.add(_safe_slug(slug.group(1)))
             bad = final_surface_violations(surface, c["evidence"], c["classes"],
-                                           known_slugs=self._known_slugs(_safe_slug(slug.group(1))))
+                                           known_slugs=topology)
+            if observations is not None:
+                observations.append({"attempt": attempt, "shape": False,
+                                     "surface": surface, "violations": list(bad)})
             if not bad:
                 break
             if attempt == 2:
@@ -589,23 +648,33 @@ class Distiller:
     _DATE_IN_TEXT = re.compile(r"\b(20\d\d)-(\d\d)-(\d\d)\b")
 
     def _compose_extension(self, c: dict,
-                           failures: list[str] | None = None) -> dict | None:
+                           failures: list[str] | None = None, *, scribe_call=None,
+                           error_endpoint=None, known_slugs=None,
+                           observations: list[dict] | None = None) -> dict | None:
         target = c["extends"]
         existing = self.store.read(target)
         if not existing:
             return None
         ev = _evidence_lines(c["evidence"])
         date = self._evidence_date()
-        out = self.scribe(prompts.EXTEND_SYS,
+        if scribe_call is None:
+            scribe_call = self.scribe
+        if error_endpoint is None:
+            error_endpoint = self.models.scribe
+        out = scribe_call(prompts.EXTEND_SYS,
                           f"MEMORY TO EXTEND: {target}\nDATE: {date}\n"
                           f"The distiller's reading (not evidence): {c.get('extends_why')}\n\n"
                           f"=== ALREADY WRITTEN THERE (do not repeat) ===\n{existing[:9000]}\n\n"
                           f"=== NEW EVIDENCE (this is everything) ===\n{ev}\n")
         if out is None and failures is not None:
-            failures.append(self.models.scribe.last_error or "the scribe did not answer")
+            failures.append(getattr(error_endpoint, "last_error", "")
+                            or "the scribe did not answer")
         body = re.search(r"^BODY:\s*\n(.*)$", out or "", re.S | re.M)
         section = re.search(r"^SECTION:\s*(.+)$", out or "", re.M)
         if not body:
+            if observations is not None:
+                observations.append({"attempt": 1, "shape": True,
+                                     "surface": out or "", "violations": []})
             return None
         _, plain = _split_draft(body.group(1))
         # The heading's date is the evidence's date, mechanically. 30 of 39 extension
@@ -623,9 +692,17 @@ class Distiller:
         # branch used to floor only the scribe's sentences, and an unbacked number
         # in the CANDIDATE's belongs_because slipped into the memory under the mark.
         cand_ann = " ".join(str(c.get(k) or "") for k in ANNOTATION_KEYS)
+        topology = (set(known_slugs) if known_slugs is not None
+                    else set(self._known_slugs(target)))
+        topology.add(target)
         bad = final_surface_violations("\n".join([head, plain, " ".join(s_ann.values()), cand_ann]),
                                        c["evidence"], c["classes"], allowed=date,
-                                       known_slugs=self._known_slugs(target))
+                                       known_slugs=topology)
+        if observations is not None:
+            observations.append({"attempt": 1, "shape": False,
+                                 "surface": "\n".join([head, plain, " ".join(s_ann.values()),
+                                                        cand_ann]),
+                                 "violations": list(bad)})
         if bad:
             _log(f"      ✗ extension surface fails the floor: {bad}")
             return None

@@ -17,6 +17,9 @@
     kura pay-forward [-s eq]          bake the map into each mouth's KV slot, save it to disk
     kura bench compress|retention     what the store cost / is what mattered still findable
     kura bench payforward --mouth N   what the pay-forward spine buys, priced by the mouth
+    kura bench packets --out FILE     freeze gate-passed candidates for a writer A/B run
+    kura bench writers --packets FILE --out DIR
+                                      compare configured or explicitly named writers
     kura metrics richness [-s eq]     did it stop remembering LIES or stop remembering (§15)
     kura init <name> --path DIR       create a store and print the TOML to paste
     kura distill catchup [-s eq]      start from today: mark every journal drunk up to now
@@ -273,6 +276,21 @@ def main(argv: list[str] | None = None) -> int:
                    help="a command that reads text on stdin and prints a token count. "
                         "Without one, figures are labelled `estimated`.")
     b.add_argument("--session", help="only batches whose source key contains this")
+    b = bsub.add_parser("packets", help="freeze gate-passed candidates for writer A/B")
+    b.add_argument("--store", dest="bench_store", help="store or mode to read")
+    b.add_argument("--out", required=True, metavar="FILE", help="packet JSON output file")
+    group = b.add_mutually_exclusive_group()
+    group.add_argument("--chunks", type=int, default=None,
+                       help="number of unprocessed journal chunks to freeze (default 1)")
+    group.add_argument("--session", help="only journal paths containing this session text")
+    b = bsub.add_parser("writers", help="compare writers on frozen candidate packets")
+    b.add_argument("--store", dest="bench_store", help="store snapshot used for composition")
+    b.add_argument("--packets", required=True, metavar="FILE")
+    b.add_argument("--out", required=True, metavar="DIR", help="report and surface directory")
+    b.add_argument("--writer", action="append", default=[], metavar="NAME=URL/MODEL",
+                   help="writer endpoint; repeatable")
+    b.add_argument("--from-config", action="store_true",
+                   help="also use [[bench.writers]] from kura.toml")
     b = bsub.add_parser("payforward", help="what the pay-forward spine buys, one mouth: "
                                            "cold, restored spine + trail, changed trail, "
                                            "changed map, warm repeat")
@@ -464,7 +482,7 @@ def main(argv: list[str] | None = None) -> int:
               else _worldline_compare_text(c))
         return 0
 
-    store = _store(reg, a.store)
+    store = _store(reg, getattr(a, "bench_store", None) or a.store)
 
     if a.cmd == "metrics":
         from . import richness
@@ -485,6 +503,36 @@ def main(argv: list[str] | None = None) -> int:
         if a.bcmd == "compress":
             print(json.dumps(bench.compress(reg, store, a.tokenizer_command, a.session),
                              ensure_ascii=False, indent=1))
+            return 0
+        if a.bcmd == "packets":
+            from . import bench_writers
+            try:
+                chunks = a.chunks if a.chunks is not None else 1
+                if chunks < 1:
+                    raise ValueError(f"--chunks must be >= 1, got {chunks}")
+                packets = bench_writers.freeze_packets(
+                    store, _distiller(reg, store), chunks=chunks, session=a.session)
+                bench_writers.save_packets(packets, a.out)
+            except (OSError, ValueError, RuntimeError) as e:
+                sys.exit(str(e))
+            print(json.dumps({"packets": len(packets), "out": a.out}, ensure_ascii=False))
+            return 0 if packets else 2
+        if a.bcmd == "writers":
+            from . import bench_writers
+            try:
+                packets = bench_writers.load_packets(a.packets)
+                writers = []
+                if a.from_config:
+                    from .thinker import Endpoint
+                    writers.extend((w["name"], Endpoint.from_dict(w, w["name"]))
+                                   for w in reg.bench_writers)
+                writers.extend(bench_writers.endpoints_from_specs(a.writer))
+                if not writers:
+                    raise ValueError("writers: provide --writer name=url/model or --from-config")
+                report = bench_writers.run_writers(packets, writers, store, a.out)
+            except (OSError, ValueError, TypeError, KeyError) as e:
+                sys.exit(str(e))
+            print(report.to_json())
             return 0
         if a.bcmd == "retention":
             r = bench.retention(reg, store, a.questions, hops=a.hops)

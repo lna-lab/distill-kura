@@ -468,6 +468,24 @@ tokenizers it was not fitted on.
 own questions against your own corpus — the shipped fixture measures the tool, not your
 store.
 
+### Comparing writers on the same evidence
+
+Freeze the unprocessed journal candidates first; packet preparation uses the normal
+brain and deterministic gate, but does not advance the production watermark:
+
+```bash
+kura bench packets --store main --chunks 2 --out packets.json
+kura bench writers --store main --packets packets.json --from-config --out writer-report
+# or add one-off endpoints as --writer name=http://127.0.0.1:8011/v1/model
+```
+
+`writer-report/report.md` pairs every packet and writer and links to the exact surface
+in `writer-report/<writer>/`. `report.json` keeps raw latency, optional endpoint usage,
+surface length, retry outcome, and separate counts for invented numbers, quotations,
+dead links, attribution, and shape failures. There is no quality score to average away
+an unsafe pass. Add writers under `[[bench.writers]]`; `rep = 1.05` is shorthand for the
+endpoint `extra` field `repeat_penalty` and is shown in both reports.
+
 ## Security
 
 There is no authentication. The default bind is `127.0.0.1`. If it must be reachable

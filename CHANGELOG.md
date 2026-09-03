@@ -2,6 +2,17 @@
 
 ## 0.3.0 — unreleased
 
+### Writer A/B benchmark on frozen candidate packets
+
+* `kura bench packets` freezes gate-passed NEW/EXTENDS candidates with their evidence
+  and known-slug store snapshot without advancing production watermarks.
+* `kura bench writers` sends every packet to every configured or one-off scribe and
+  writes paired raw rows plus the reviewed surfaces. The existing compose floors remain
+  authoritative; reports separate invented numbers, quotations, dead links, human
+  attribution, malformed shape, retry repair, latency, usage, and surface length.
+* `[[bench.writers]]` accepts the model endpoint fields, rejects unknown keys, and has
+  `rep` shorthand for `extra.repeat_penalty`.
+
 ### Two more floors on a composed surface — dead links and invented quotations
 
 Rina's ruling (2026-09-03): "existence, quotation, numbers, attribution are floors;

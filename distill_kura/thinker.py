@@ -64,6 +64,7 @@ class Endpoint:
     extra: dict = field(default_factory=dict)   # merged into the request body verbatim
     name: str = "thinker"
     last_error: str = ""             # why the last call failed, for health and logs
+    last_usage: dict | None = None   # usage from the last answered call, when reported
 
     @classmethod
     def from_dict(cls, d: dict, name: str, base: "Endpoint | None" = None) -> "Endpoint":
@@ -103,6 +104,7 @@ class Endpoint:
         if not self.url:
             self.last_error = "no url configured"
             return None                 # unconfigured is unreachable, not "somewhere else"
+        self.last_usage = None
         headers = {"Content-Type": "application/json", **bearer_headers(self.api_key_env)}
         # The note rides the HTTP failure instead of being written to last_error here:
         # written here it was a dead store — every exit path below reassigns last_error
@@ -119,6 +121,7 @@ class Endpoint:
                     headers=headers)
                 with urllib.request.urlopen(req, timeout=timeout or self.timeout) as r:
                     d = json.load(r)
+                self.last_usage = d.get("usage") if isinstance(d.get("usage"), dict) else None
                 choice = d["choices"][0]
                 choice["message"]           # the shape ask() has always demanded
                 self.last_error = ""

@@ -110,6 +110,11 @@ _MODEL_ROLES = {"thinker", "brain", "scribe"}
 _MODEL_TYPES = {"url": str, "model": str, "api_key_env": str, "timeout": (int, float),
                 "temperature": (int, float), "effort": str, "thinking": bool,
                 "dialect": str, "extra": dict}
+# Writer A/B entries deliberately use the endpoint's explicit fields rather than a
+# second private config vocabulary. `rep` is the one bench convenience: it becomes a
+# request extra so a report can say whether 1.00 or 1.05 was actually tested.
+_BENCH_WRITER_TYPES = {"name": str, **_MODEL_TYPES, "rep": (int, float)}
+_BENCH_WRITER_REQUIRED = ("name", "url", "model")
 
 
 def _check_models(where: str, cfg) -> None:
@@ -334,6 +339,51 @@ def _check_mouths(raw: dict, stores: dict[str, Store]) -> None:
                              f"store. Known: {sorted(stores)}")
 
 
+def _check_bench_writers(raw: dict) -> None:
+    """Validate benchmark writers at load, so a misspelled endpoint is not a
+    successful benchmark of zero writers.
+
+    The benchmark compares raw writer behaviour. Silently dropping `api_key_env`,
+    `extra`, or a misspelled repetition setting would compare different requests than
+    the operator thought they configured, which is worse than refusing the run."""
+    bench = raw.get("bench")
+    if bench is None:
+        bench = {}
+    if not isinstance(bench, dict):
+        raise ValueError(f"[bench] must be a table, got {type(bench).__name__}")
+    unknown = {k for k in bench if k != "writers" and not k.startswith("x_")}
+    if unknown:
+        raise ValueError(f"[bench] has unknown key(s) {sorted(unknown)}. "
+                         "Known: ['writers']. Use an `x_`-prefixed name for your own "
+                         "extensions.")
+    writers = bench.get("writers") or []
+    if not isinstance(writers, list):
+        raise ValueError(f"[bench] writers must be an array of tables "
+                         f"([[bench.writers]]), got {type(writers).__name__}")
+    seen: set[str] = set()
+    for i, w in enumerate(writers):
+        where = f"bench.writers[{i}]"
+        if not isinstance(w, dict):
+            raise ValueError(f"[{where}] must be a table ([[bench.writers]])")
+        for k in _BENCH_WRITER_REQUIRED:
+            if not w.get(k):
+                raise ValueError(f"[{where}] needs `{k}`")
+        unknown = {k for k in w if k not in _BENCH_WRITER_TYPES and not k.startswith("x_")}
+        if unknown:
+            raise ValueError(f"[{where}] has unknown key(s) {sorted(unknown)}. "
+                             f"Known: {sorted(_BENCH_WRITER_TYPES)}. "
+                             "Use an `x_`-prefixed name for your own extensions.")
+        _check_table(where, w, _BENCH_WRITER_TYPES)
+        d = w.get("dialect")
+        if d is not None and d not in ("vllm", "openai", "generic"):
+            raise ValueError(f"[{where}] dialect must be vllm, openai or generic, got {d!r}")
+        name = str(w["name"])
+        if name in seen:
+            raise ValueError(f"[bench] two writers named {name!r}: paired report rows "
+                             "would no longer identify one endpoint uniquely")
+        seen.add(name)
+
+
 @dataclass
 class Registry:
     stores: dict[str, Store]
@@ -409,6 +459,7 @@ class Registry:
                     f"Rename one of them.")
         _check_paths(stores, raw)
         _check_mouths(raw, stores)
+        _check_bench_writers(raw)
         models_cfg = raw.get("models")
         if not models_cfg and os.environ.get("KURA_THINKER_URL"):      # legacy env
             models_cfg = {"thinker": {"url": os.environ["KURA_THINKER_URL"],
@@ -527,6 +578,36 @@ class Registry:
                 for m in (self.raw.get("payforward") or {}).get("mouths") or []]
 
     @property
+    def bench_writers(self) -> list[dict]:
+        """The configured A/B writers, with `rep` made into an endpoint extra.
+
+        The request body is the thing being compared. Keeping the repetition setting
+        in `extra` means the same endpoint can be benchmarked at 1.00 and 1.05 while
+        the report records the knob that changed, instead of hiding it in a label."""
+        out = []
+        for raw in (self.raw.get("bench") or {}).get("writers") or []:
+            w = {k: v for k, v in raw.items() if k in _MODEL_TYPES or k == "name"}
+            w["name"] = str(raw["name"])
+            w["url"] = str(raw["url"])
+            w["model"] = str(raw["model"])
+            if "extra" in w:
+                w["extra"] = dict(w["extra"])
+            else:
+                w["extra"] = {}
+            if raw.get("rep") is not None:
+                # Explicit extra wins: it names the exact API field, while `rep` is
+                # only shorthand. Two values would be an endpoint ambiguity.
+                if "repeat_penalty" not in w["extra"] and "repetition_penalty" not in w["extra"]:
+                    w["extra"]["repeat_penalty"] = raw["rep"]
+                w["rep"] = raw["rep"]
+            else:
+                w["rep"] = (w["extra"].get("repeat_penalty")
+                             if "repeat_penalty" in w["extra"]
+                             else w["extra"].get("repetition_penalty"))
+            out.append(w)
+        return out
+
+    @property
     def fastpath_cfg(self) -> dict:
         return dict(self.raw.get("fastpath") or {})
 
@@ -546,5 +627,8 @@ class Registry:
             "prefill": self.prefill_cfg,
             "fastpath": self.fastpath_cfg,
             "payforward": {"mouths": self.payforward_mouths},
+            "bench": {"writers": [{"name": w["name"], "url": w["url"],
+                                    "model": w["model"], "rep": w.get("rep")}
+                                   for w in self.bench_writers]},
             "config": self.config_path,
         }
