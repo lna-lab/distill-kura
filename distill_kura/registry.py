@@ -57,6 +57,7 @@ With no config at all, `$KURA_DIR` (or `./memory`) becomes a single store named
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 
@@ -65,6 +66,13 @@ from .thinker import Models
 from .prefill import RESIDENT_MODES
 
 CONFIG_CANDIDATES = ("kura.toml", os.path.expanduser("~/.config/distill-kura/kura.toml"))
+
+# What an AUTO-PROVISIONED store may be called. A caller-supplied name becomes a
+# directory under `[server] auto_store_root`, so it must be a single safe path
+# component: no separators, no dots (a dot can never survive this alphabet), no
+# leading/trailing dash. Configured stores and modes are checked first and win,
+# so auto-provisioning can never shadow them.
+_STORE_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}[a-z0-9]$")
 
 # Keys a [stores.<name>] table may carry. Anything else is a typo until proven
 # otherwise; extensions use an `x_` prefix so they are visibly not ours.
@@ -350,6 +358,12 @@ class Registry:
     host: str = "127.0.0.1"
     port: int = 8085
     config_path: str | None = None
+    # Where a store NOT declared in kura.toml may be auto-provisioned on first use.
+    # None = strict default: an unknown store is an error, never created.
+    auto_store_root: str | None = None
+    # Names auto-provisioned under auto_store_root — distinguished from CONFIGURED
+    # stores so the "never shadow a configured store" guard stays honest.
+    auto_stores: set[str] = field(default_factory=set)
     raw: dict = field(default_factory=dict)
 
     # ── loading ──────────────────────────────────────────────────────────
@@ -457,11 +471,16 @@ class Registry:
             port = int(port_raw)
         else:
             port = port_raw
+        auto_root = srv.get("auto_store_root")
+        if auto_root is not None and not isinstance(auto_root, str):
+            raise ValueError(f"[server] auto_store_root must be a path string, "
+                             f"got {type(auto_root).__name__} ({auto_root!r})")
         return cls(stores=stores, modes=modes, models=Models.from_config(models_cfg),
                    profiles=profiles,
                    default=default, host=srv.get("host", "127.0.0.1"),
                    port=port,
-                   config_path=path, raw=raw)
+                   config_path=path, raw=raw,
+                   auto_store_root=os.path.expanduser(auto_root) if auto_root else None)
 
     # ── lookups ──────────────────────────────────────────────────────────
     def store(self, name: str | None = None) -> Store:
@@ -489,6 +508,31 @@ class Registry:
             return self.store(mode)
         except KeyError:
             return self.stores[self.default]
+
+    def ensure_store(self, name: str) -> Store | None:
+        """Auto-provision a store that kura.toml does not declare, under
+        `[server] auto_store_root` — or None when that is not possible.
+
+        This is the deliberate, opt-in exception to "an unknown store is an error":
+        a host that routes the working directory to a logical store (an OpenCode
+        plugin) needs the store to exist on first use. The store is created on disk
+        (`init_files`) and held in memory; kura.toml is never rewritten. A store that
+        IS configured, or a name that is not a single safe path component, is never
+        created — the caller keeps the strict error instead."""
+        if not self.auto_store_root or not name:
+            return None
+        # Never shadow a configured store or a mode.
+        if name in self.modes or name in self.raw.get("stores", {}):
+            return None
+        if name in self.auto_stores:
+            return self.stores[name]
+        if not _STORE_NAME.match(name):
+            return None
+        st = Store(name=name, path=os.path.join(self.auto_store_root, name))
+        st.init_files()
+        self.stores[name] = st
+        self.auto_stores.add(name)
+        return st
 
     def models_for(self, store: Store) -> Models:
         """The model roles THIS store may use.

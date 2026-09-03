@@ -96,6 +96,13 @@ def _make_handler(reg: Registry):
             try:
                 return reg.store(sel or None), None
             except KeyError:
+                # Opt-in auto-provisioning: when `[server] auto_store_root` is set, a
+                # caller-supplied store name (e.g. from an OpenCode plugin routing the
+                # working directory) creates its store on first use. Anything else —
+                # no root, a mode name, an unsafe name — stays the strict error.
+                st = reg.ensure_store(sel)
+                if st is not None:
+                    return st, None
                 return None, {"error": f"unknown store or mode: {sel!r}",
                               "stores": sorted(reg.stores), "modes": reg.modes}
 
