@@ -70,10 +70,10 @@ CONFIG_CANDIDATES = ("kura.toml", os.path.expanduser("~/.config/distill-kura/kur
 # otherwise; extensions use an `x_` prefix so they are visibly not ours.
 STORE_KEYS = {"path", "label", "readonly", "write_policy", "persona", "charter",
               "model_profile"}
-NESTED_KEYS = {"distill", "prefill", "fastpath"}
+NESTED_KEYS = {"distill", "prefill", "fastpath", "warm"}
 _TYPES = {"path": str, "label": str, "readonly": bool, "write_policy": str,
           "persona": str, "charter": str, "model_profile": str,
-          "distill": dict, "prefill": dict, "fastpath": dict}
+          "distill": dict, "prefill": dict, "fastpath": dict, "warm": dict}
 # The nested tables need checking too: `inherit_global_journals = "false"` is a STRING,
 # therefore truthy, so a store inherited the global intake it had explicitly declined.
 _DISTILL_TYPES = {"inherit_global_journals": bool, "journals": dict, "language": str,
@@ -96,6 +96,10 @@ _PREFILL_TYPES = {"window_tokens": int, "budget_fraction": float, "hard_fraction
 # Tier zero of recall (`fastpath.py`). `gate` is the honesty bar: a hit below it is
 # silence, and silence goes to the thinker.
 _FASTPATH_TYPES = {"enabled": bool, "gate": (int, float), "cues": bool}
+# Warming the thinker after the index moves (`warm.py`). `question` is the probe whose
+# answer is never read; `timeout` must outlast a cold prefill of the whole index (279 s
+# measured 2026-09-03), which is why it is not the thinker's own 120 s default.
+_WARM_TYPES = {"enabled": bool, "question": str, "timeout": (int, float)}
 # One mouth `kura pay-forward` bakes the resident map into (`payforward.py`). `url` is
 # the llama.cpp-compatible server's BASE — the slots API lives beside /v1, not under it
 # — and `store` names whose map the mouth wears.
@@ -217,6 +221,8 @@ def _check_types(name: str, sc: dict) -> None:
     _check_prefill(f"stores.{name}.prefill", sc.get("prefill") or {})
     _check_unknown(f"stores.{name}.fastpath", sc.get("fastpath") or {}, _FASTPATH_TYPES)
     _check_table(f"stores.{name}.fastpath", sc.get("fastpath") or {}, _FASTPATH_TYPES)
+    _check_unknown(f"stores.{name}.warm", sc.get("warm") or {}, _WARM_TYPES)
+    _check_table(f"stores.{name}.warm", sc.get("warm") or {}, _WARM_TYPES)
 
 
 def _real(path: str) -> str:
@@ -391,6 +397,8 @@ class Registry:
         _check_prefill("prefill", raw.get("prefill") or {})
         _check_unknown("fastpath", raw.get("fastpath") or {}, _FASTPATH_TYPES)
         _check_table("fastpath", raw.get("fastpath") or {}, _FASTPATH_TYPES)
+        _check_unknown("warm", raw.get("warm") or {}, _WARM_TYPES)
+        _check_table("warm", raw.get("warm") or {}, _WARM_TYPES)
         srv = raw.get("server") or {}
         default = srv.get("default") or next(iter(stores))
         if default not in stores:
@@ -532,6 +540,9 @@ class Registry:
 
     def fastpath_cfg_for(self, store: Store) -> dict:
         return self._cfg_for(store, "fastpath")
+
+    def warm_cfg_for(self, store: Store) -> dict:
+        return self._cfg_for(store, "warm")
 
     def describe(self) -> dict:
         return {

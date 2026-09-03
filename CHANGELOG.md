@@ -2,6 +2,28 @@
 
 ## 0.3.0 — unreleased
 
+### Warming the thinker after the index moves (`kura warm`)
+
+Measured 2026-09-03 on a CPU-hybrid mouth (GLM-5.3-Flash, prefill ≈100 tok/s): the first
+thinker-path recall after ANY change to `index_text()` cost **279 s**; warm repeats cost
+10–18 s. Pay-forward does not help — it bakes the resident map block, whose bytes are
+not the recall prompt's bytes, so the prefix cache misses.
+
+* **`distill_kura/warm.py`.** `warm_thinker(store, thinker, question=...)` sends exactly
+  the prompt recall would send — `recall.pick_prompt`, factored out so the two cannot
+  drift — with `max_tokens=1`, never parses the reply, and never raises. Returns
+  `{"ok", "seconds", "index_hash", "chars", "error"}`.
+* **`kura warm [--force]`.** 0 = warmed, 2 = this index was already warm or `[warm]` is
+  off, 1 = the mouth failed.
+* **A `warm` track in `kura tend`,** scheduled whenever the store's index hash has moved
+  since the last warming — after a pour, a weave, a tidy, or a memory written by hand.
+  The debounce is that hash, in memory and in `_still/warm.json` so a restart does not
+  re-pay a prefill the mouth still holds. Hand-written changes are picked up at the
+  watcher's next tick; no inotify.
+* **`[warm]` table** (`enabled`, `question`, `timeout`), per-store overridable, with
+  unknown keys refused at load like `[prefill]` and `[fastpath]`. Every attempt appends
+  a row to `_still/warm.jsonl` — measurement, not claim.
+
 ### Two more floors on a composed surface — dead links and invented quotations
 
 Rina's ruling (2026-09-03): "existence, quotation, numbers, attribution are floors;

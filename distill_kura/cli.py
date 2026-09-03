@@ -266,6 +266,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--mouth", help="only this mouth (by [[payforward.mouths]] name)")
     p.add_argument("--force", action="store_true", help="re-bake even when the etag says fresh")
 
+    p = sub.add_parser("warm", help="warm the thinker with the exact prompt recall sends, "
+                       "so the first recall after an index change does not pay the cold prefill")
+    p.add_argument("--force", action="store_true",
+                   help="warm even when this index was already warmed")
+
     p = sub.add_parser("bench", help="measure, rather than claim")
     bsub = p.add_subparsers(dest="bcmd")
     b = bsub.add_parser("compress", help="store_ratio and map_ratio for a store")
@@ -655,6 +660,16 @@ def main(argv: list[str] | None = None) -> int:
                   f"or raise budget_fraction if the window can afford it.",
                   file=sys.stderr)
         return 0
+
+    if a.cmd == "warm":
+        from . import warm as warmmod
+        r = warmmod.run(reg, store, force=a.force)
+        print(json.dumps(r, ensure_ascii=False))
+        if r["did"] == "warmed":
+            return 0
+        # "already warm" and "switched off" are both "nothing to do" — the same exit 2
+        # the watcher rests on, so a scheduler does not read them as work done.
+        return 2 if r["did"] in ("fresh", "disabled") else 1
 
     if a.cmd == "recall":
         d = do_recall(store, reg.models_for(store).thinker, a.question, a.hops, a.top,
