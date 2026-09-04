@@ -592,3 +592,86 @@ Harness  governs identity, authority and composition
 Kura は **会社の脳そのものではない**。
 
 会社と agent が経験から学ぶための、根拠付き長期記憶器官であり続ける。
+
+---
+
+# 24. Lna-Depot Harbor provenance
+
+Lna-Depot の **Harbor** は、Depot が verify / seal した model・dataset・tokenizer 等を Hugging Face Hub 互換を目標とする protocol で供給する transport surface である。
+
+Kura は Harbor を storage authority として再実装しない。
+
+また、`huggingface_hub` 等で取得できたという事実だけを「正しいmodelを使った」証拠にはしない。
+
+記憶上の model/input provenance は可能な限り次を参照する。
+
+```text
+Depot asset revision
+Harbor logical repository
+Harbor exact revision
+object/content hash where needed
+Factory run evidence
+Stacks promoted artifact where internal
+```
+
+## 24.1 External model の記憶
+
+例:
+
+```text
+Market/HF says model X exists
+        !=
+Depot says X@abc is SEALED
+        !=
+Harbor says X@abc is locally available
+        !=
+Factory measured X@abc under condition Y
+```
+
+Kura に残す再利用知識は最後の measured/evidence-linked relation を優先する。
+
+「HF上にあった」「Harborで落とせた」を性能事実へ昇格させない。
+
+## 24.2 Internal model の記憶
+
+Lna-Lab 内製 model の場合:
+
+```text
+Factory produced
+  -> Stacks PROMOTED
+  -> Harness approval
+  -> Depot sealed
+  -> Harbor distributed
+```
+
+Kura は、必要ならこの chain を provenance として記憶できる。
+
+ただし:
+
+- Stacks promotion
+- Depot verification
+- Harbor visibility
+
+のどれも Kura が決めない。
+
+## 24.3 Stable references
+
+Harbor endpoint URL / NAS path / current hostname を memory identity にしない。
+
+可能なら logical IDs を使う。
+
+```text
+depot_revision_id
+harbor_repository_id
+harbor_revision
+stacks_artifact_revision
+factory_run_id
+```
+
+これにより Harbor implementation や endpoint が変わっても記憶の意味を維持する。
+
+## 24.4 Kura側の成功条件追加
+
+- Harbor経由で使ったmodelについて、transport endpointではなく exact Depot/Harbor revision を evidence として辿れる
+- external availability / local availability / measured performance を混同しない
+- Harborが停止・交換されても memory identity が壊れない
